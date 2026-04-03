@@ -56,6 +56,11 @@ fn validate_points(points: &[Vec<f64>]) -> Result<usize, GeometryError> {
     Ok(dim)
 }
 
+#[inline]
+fn squared_norm(point: &[f64]) -> f64 {
+    point.iter().map(|coord| coord * coord).sum()
+}
+
 fn determinant(matrix: &[Vec<f64>]) -> Result<f64, GeometryError> {
     let n = matrix.len();
     if n == 0 {
@@ -121,6 +126,16 @@ pub fn matrix_rank(vectors: &[Vec<f64>], tol: f64) -> Result<usize, GeometryErro
     let rows = vectors.len();
     let flat: Vec<f64> = vectors.iter().flat_map(|row| row.iter().copied()).collect();
     let svd = DMatrix::from_row_slice(rows, cols, &flat).svd(false, false);
+    let max_singular = svd
+        .singular_values
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max);
+    let tol = if tol.is_sign_positive() {
+        tol
+    } else {
+        f64::EPSILON * rows.max(cols) as f64 * max_singular
+    };
     Ok(svd
         .singular_values
         .iter()
@@ -128,30 +143,46 @@ pub fn matrix_rank(vectors: &[Vec<f64>], tol: f64) -> Result<usize, GeometryErro
         .count())
 }
 
-pub fn fast_2d_point_in_simplex(point: &[f64; 2], simplex: &[[f64; 2]; 3], eps: f64) -> bool {
+pub fn numpy_matrix_rank(vectors: &[Vec<f64>]) -> Result<usize, GeometryError> {
+    matrix_rank(vectors, -1.0)
+}
+
+pub fn fast_2d_point_in_simplex(
+    point: &[f64; 2],
+    simplex: &[[f64; 2]; 3],
+    eps: f64,
+) -> Result<bool, GeometryError> {
     let [[p0x, p0y], [p1x, p1y], [p2x, p2y]] = *simplex;
     let [px, py] = *point;
 
     let area: f64 = 0.5
         * (-p1y * p2x + p0y * (p2x - p1x) + p1x * p2y + p0x * (p1y - p2y));
-    if area.abs() <= f64::EPSILON {
-        return false;
+    if area == 0.0 {
+        return Err(GeometryError::DegenerateSimplex);
     }
 
     let s = 1.0 / (2.0 * area)
         * (p0y * p2x + (p2y - p0y) * px - p0x * p2y + (p0x - p2x) * py);
     if s < -eps || s > 1.0 + eps {
-        return false;
+        return Ok(false);
     }
 
     let t = 1.0 / (2.0 * area)
         * (p0x * p1y + (p0y - p1y) * px - p0y * p1x + (p1x - p0x) * py);
-    t >= -eps && s + t <= 1.0 + eps
+    Ok(t >= -eps && s + t <= 1.0 + eps)
 }
 
-pub fn point_in_simplex(point: &[f64], simplex: &[Vec<f64>], eps: f64) -> bool {
+pub fn point_in_simplex(point: &[f64], simplex: &[Vec<f64>], eps: f64) -> Result<bool, GeometryError> {
     if simplex.is_empty() || simplex.len() != point.len() + 1 {
-        return false;
+        return Err(GeometryError::InvalidDimensions(
+            "Simplex dimension mismatch".to_string(),
+        ));
+    }
+    validate_points(simplex)?;
+    if simplex.iter().any(|vertex| vertex.len() != point.len()) {
+        return Err(GeometryError::InvalidDimensions(
+            "Simplex dimension mismatch".to_string(),
+        ));
     }
     if point.len() == 2 && simplex.len() == 3 {
         let point = [point[0], point[1]];
@@ -175,11 +206,8 @@ pub fn point_in_simplex(point: &[f64], simplex: &[Vec<f64>], eps: f64) -> bool {
         }
     }
 
-    let Ok(alpha) = solve_square(&matrix, &rhs) else {
-        return false;
-    };
-
-    alpha.iter().all(|value| *value > -eps) && alpha.iter().sum::<f64>() < 1.0 + eps
+    let alpha = solve_square(&matrix, &rhs)?;
+    Ok(alpha.iter().all(|value| *value > -eps) && alpha.iter().sum::<f64>() < 1.0 + eps)
 }
 
 pub fn fast_2d_circumcircle(points: &[[f64; 2]; 3]) -> ([f64; 2], f64) {
@@ -267,40 +295,26 @@ pub fn circumsphere(pts: &[Vec<f64>]) -> Result<(Vec<f64>, f64), GeometryError> 
         return Ok((center.into_iter().collect(), radius));
     }
 
-    let rows = pts.len();
-    let cols = dim + 2;
-    let mut mat = vec![vec![0.0; cols]; rows];
-    for (row, point) in pts.iter().enumerate() {
-        mat[row][0] = point.iter().map(|coord| coord * coord).sum();
-        for (col, coord) in point.iter().enumerate() {
-            mat[row][col + 1] = *coord;
+    let x0 = &pts[0];
+    let x0_sq = squared_norm(x0);
+    let mut matrix = vec![vec![0.0; dim]; dim];
+    let mut rhs = vec![0.0; dim];
+
+    for row in 0..dim {
+        let point = &pts[row + 1];
+        rhs[row] = squared_norm(point) - x0_sq;
+        for col in 0..dim {
+            matrix[row][col] = 2.0 * (point[col] - x0[col]);
         }
-        mat[row][cols - 1] = 1.0;
     }
 
-    let denominator: Vec<Vec<f64>> = mat
-        .iter()
-        .map(|row| row[1..].to_vec())
-        .collect();
-    let a = determinant(&denominator)?;
-    if a.abs() <= f64::EPSILON {
-        return Err(GeometryError::SingularMatrix);
-    }
-
-    let mut center = Vec::with_capacity(dim);
-    for column in 1..rows {
-        let minor: Vec<Vec<f64>> = mat
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .filter_map(|(idx, value)| (idx != column).then_some(*value))
-                    .collect()
-            })
-            .collect();
-        let factor = if (column + 1) % 2 == 0 { 1.0 } else { -1.0 };
-        center.push(factor * determinant(&minor)? / (2.0 * a));
-    }
+    let center = match solve_square(&matrix, &rhs) {
+        Ok(center) => center,
+        Err(GeometryError::SingularMatrix) => {
+            return Ok((vec![f64::NAN; dim], f64::NAN));
+        }
+        Err(err) => return Err(err),
+    };
 
     let radius = fast_norm(
         &center
@@ -310,6 +324,60 @@ pub fn circumsphere(pts: &[Vec<f64>]) -> Result<(Vec<f64>, f64), GeometryError> 
             .collect::<Vec<_>>(),
     );
     Ok((center, radius))
+}
+
+fn slogdet(matrix: &[Vec<f64>]) -> Result<(f64, f64), GeometryError> {
+    let n = matrix.len();
+    if n == 0 {
+        return Ok((1.0, 0.0));
+    }
+    if matrix.iter().any(|row| row.len() != n) {
+        return Err(GeometryError::InvalidDimensions(
+            "Matrix must be square".to_string(),
+        ));
+    }
+
+    let mut work = matrix.to_vec();
+    let mut sign = 1.0;
+    let mut log_abs_det = 0.0;
+
+    for pivot_col in 0..n {
+        let mut pivot_row = pivot_col;
+        let mut pivot_abs = work[pivot_col][pivot_col].abs();
+        for row in (pivot_col + 1)..n {
+            let candidate = work[row][pivot_col].abs();
+            if candidate > pivot_abs {
+                pivot_abs = candidate;
+                pivot_row = row;
+            }
+        }
+
+        if pivot_abs == 0.0 {
+            return Ok((0.0, f64::NEG_INFINITY));
+        }
+
+        if pivot_row != pivot_col {
+            work.swap(pivot_row, pivot_col);
+            sign = -sign;
+        }
+
+        let pivot = work[pivot_col][pivot_col];
+        if pivot == 0.0 {
+            return Ok((0.0, f64::NEG_INFINITY));
+        }
+        sign *= pivot.signum();
+        log_abs_det += pivot.abs().ln();
+
+        for row in (pivot_col + 1)..n {
+            let factor = work[row][pivot_col] / pivot;
+            work[row][pivot_col] = 0.0;
+            for col in (pivot_col + 1)..n {
+                work[row][col] -= factor * work[pivot_col][col];
+            }
+        }
+    }
+
+    Ok((sign, log_abs_det))
 }
 
 pub fn orientation(face: &[Vec<f64>], origin: &[f64]) -> Result<i32, GeometryError> {
@@ -324,10 +392,10 @@ pub fn orientation(face: &[Vec<f64>], origin: &[f64]) -> Result<i32, GeometryErr
         .iter()
         .map(|point| point.iter().zip(origin).map(|(x, y)| x - y).collect())
         .collect();
-    let det = determinant(&matrix)?;
-    if det.abs() < (-50.0f64).exp() {
+    let (sign, log_det) = slogdet(&matrix)?;
+    if sign == 0.0 || log_det < -50.0 {
         Ok(0)
-    } else if det.is_sign_positive() {
+    } else if sign.is_sign_positive() {
         Ok(1)
     } else {
         Ok(-1)
@@ -359,6 +427,12 @@ pub fn simplex_volume_in_embedding(vertices: &[Vec<f64>]) -> Result<f64, Geometr
     if vertices.len() < 2 {
         return Err(GeometryError::InvalidDimensions(
             "Expected at least two vertices".to_string(),
+        ));
+    }
+
+    if vertices[0].len() == 2 && vertices.len() != 3 {
+        return Err(GeometryError::InvalidDimensions(
+            "Expected three 2D vertices".to_string(),
         ));
     }
 
