@@ -1,0 +1,26 @@
+[package]
+name = "adaptive-triangulation"
+version = "0.1.0"
+edition = "2021"
+description = "Fast N-dimensional Delaunay triangulation with incremental point insertion (Bowyer-Watson)"
+license = "BSD-3-Clause"
+repository = "https://github.com/python-adaptive/adaptive-triangulation"
+readme = "README.md"
+keywords = ["triangulation", "delaunay", "bowyer-watson", "computational-geometry"]
+categories = ["science", "mathematics"]
+
+[lib]
+name = "adaptive_triangulation"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py311"] }
+numpy = "0.23"
+nalgebra = "0.33"
+thiserror = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true

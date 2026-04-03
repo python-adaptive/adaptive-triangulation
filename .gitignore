@@ -1,0 +1,6 @@
+target/
+.venv
+*.so
+*.dylib
+__pycache__/
+.claude/

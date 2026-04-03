@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "adaptive-triangulation"
+version = "0.1.0"
+description = "Fast N-dimensional Delaunay triangulation with incremental point insertion"
+readme = "README.md"
+license = "BSD-3-Clause"
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0", "scipy>=1.10"]
+
+[project.urls]
+Homepage = "https://github.com/python-adaptive/adaptive-triangulation"
+Repository = "https://github.com/python-adaptive/adaptive-triangulation"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "adaptive_triangulation._rust"
