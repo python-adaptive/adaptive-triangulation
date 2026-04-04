@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from adaptive_triangulation._rust import (
     Triangulation,
+    __version__ as __version__,
     circumsphere,
     fast_2d_circumcircle,
     fast_2d_point_in_simplex,
@@ -38,6 +39,7 @@ from adaptive_triangulation._rust import (
 
 __all__ = [
     "Triangulation",
+    "__version__",
     "circumsphere",
     "fast_2d_circumcircle",
     "fast_2d_point_in_simplex",
@@ -49,5 +51,3 @@ __all__ = [
     "simplex_volume_in_embedding",
     "volume",
 ]
-
-__version__ = "0.1.0"

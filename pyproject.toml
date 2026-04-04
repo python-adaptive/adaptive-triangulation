@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "adaptive-triangulation"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Fast N-dimensional Delaunay triangulation with incremental point insertion"
 readme = "README.md"
 license = "BSD-3-Clause"
