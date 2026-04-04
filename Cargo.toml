@@ -13,6 +13,9 @@ categories = ["science", "mathematics"]
 name = "adaptive_triangulation"
 crate-type = ["cdylib", "rlib"]
 
+[dev-dependencies]
+criterion = "0.5"
+
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py311"] }
 numpy = "0.23"
@@ -24,3 +27,7 @@ lto = true
 codegen-units = 1
 opt-level = 3
 strip = true
+
+[[bench]]
+name = "bench_triangulation"
+harness = false
