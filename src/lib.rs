@@ -1,5 +1,5 @@
-mod geometry;
-mod triangulation;
+pub mod geometry;
+pub mod triangulation;
 
 use pyo3::exceptions::{PyValueError, PyZeroDivisionError};
 use pyo3::prelude::*;

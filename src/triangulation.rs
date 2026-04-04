@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+use std::sync::RwLock;
 
 use numpy::PyArray2;
 use pyo3::exceptions::{
@@ -7,6 +8,7 @@ use pyo3::exceptions::{
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyList, PyModule, PySet, PyTuple};
+use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
 
 use crate::geometry::{self, GeometryError};
@@ -125,11 +127,11 @@ pub(crate) fn parse_signed_simplex_set(obj: &Bound<'_, PyAny>) -> PyResult<Vec<V
     Ok(simplices)
 }
 
-pub(crate) fn parse_signed_index_set(obj: &Bound<'_, PyAny>) -> PyResult<HashSet<isize>> {
+pub(crate) fn parse_signed_index_set(obj: &Bound<'_, PyAny>) -> PyResult<FxHashSet<isize>> {
     let Ok(iter) = obj.try_iter() else {
         return Err(PyTypeError::new_err("Expected an iterable of vertex indices"));
     };
-    let mut indices = HashSet::new();
+    let mut indices = FxHashSet::default();
     for item in iter {
         indices.insert(item?.extract::<isize>()?);
     }
@@ -181,9 +183,9 @@ pub(crate) fn canonicalize_simplex(
 }
 
 pub(crate) fn normalize_index_set(
-    indices: &HashSet<isize>,
+    indices: &FxHashSet<isize>,
     len: usize,
-) -> Result<HashSet<usize>, TriangulationError> {
+) -> Result<FxHashSet<usize>, TriangulationError> {
     indices
         .iter()
         .map(|&index| normalize_index(index, len))
@@ -207,9 +209,9 @@ fn canonical_simplex_from_py(
 fn simplex_set_from_py(
     obj: &Bound<'_, PyAny>,
     len: usize,
-) -> PyResult<HashSet<Simplex>> {
+) -> PyResult<FxHashSet<Simplex>> {
     let simplices = parse_signed_simplex_set(obj)?;
-    let mut normalized = HashSet::new();
+    let mut normalized = FxHashSet::default();
     for simplex in simplices {
         normalized.insert(normalize_indices(&simplex, len).map_err(TriangulationError::into_pyerr)?);
     }
@@ -219,7 +221,7 @@ fn simplex_set_from_py(
 fn vertex_index_set_from_py(
     obj: &Bound<'_, PyAny>,
     len: usize,
-) -> PyResult<HashSet<usize>> {
+) -> PyResult<FxHashSet<usize>> {
     normalize_index_set(&parse_signed_index_set(obj)?, len).map_err(TriangulationError::into_pyerr)
 }
 
@@ -231,7 +233,7 @@ pub(crate) fn simplex_tuple(py: Python<'_>, simplex: &[usize]) -> Py<PyTuple> {
     PyTuple::new(py, simplex.iter().copied()).unwrap().into()
 }
 
-pub(crate) fn simplex_set_py(py: Python<'_>, simplices: &HashSet<Simplex>) -> PyResult<Py<PyAny>> {
+pub(crate) fn simplex_set_py(py: Python<'_>, simplices: &FxHashSet<Simplex>) -> PyResult<Py<PyAny>> {
     let tuples: Vec<Py<PyAny>> = simplices
         .iter()
         .map(|simplex| simplex_tuple(py, simplex).into())
@@ -342,12 +344,25 @@ fn is_close(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1e-8 + 1e-5 * b.abs()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Triangulation {
     pub vertices: Vec<Vec<f64>>,
-    pub simplices: HashSet<Simplex>,
-    pub vertex_to_simplices: Vec<HashSet<Simplex>>,
+    pub simplices: FxHashSet<Simplex>,
+    pub vertex_to_simplices: Vec<FxHashSet<Simplex>>,
     pub dim: usize,
+    last_simplex: RwLock<Option<Simplex>>,
+}
+
+impl Clone for Triangulation {
+    fn clone(&self) -> Self {
+        Self {
+            vertices: self.vertices.clone(),
+            simplices: self.simplices.clone(),
+            vertex_to_simplices: self.vertex_to_simplices.clone(),
+            dim: self.dim,
+            last_simplex: RwLock::new(self.last_simplex.read().unwrap().clone()),
+        }
+    }
 }
 
 impl Triangulation {
@@ -444,10 +459,11 @@ impl Triangulation {
     ) -> Result<Self, TriangulationError> {
         let dim = Self::validate_coords(&coords)?;
         let mut triangulation = Self {
-            vertex_to_simplices: vec![HashSet::new(); coords.len()],
+            vertex_to_simplices: vec![FxHashSet::default(); coords.len()],
             vertices: coords,
-            simplices: HashSet::new(),
+            simplices: FxHashSet::default(),
             dim,
+            last_simplex: RwLock::new(None),
         };
         for simplex in simplices {
             triangulation.add_simplex(simplex)?;
@@ -458,13 +474,14 @@ impl Triangulation {
     pub fn new(coords: Vec<Vec<f64>>) -> Result<Self, TriangulationError> {
         let dim = Self::validate_coords(&coords)?;
         let seed_simplex = Self::find_seed_simplex(&coords, dim)?;
-        let seed_vertices: HashSet<usize> = seed_simplex.iter().copied().collect();
+        let seed_vertices: FxHashSet<usize> = seed_simplex.iter().copied().collect();
 
         let mut triangulation = Self {
-            vertex_to_simplices: vec![HashSet::new(); coords.len()],
+            vertex_to_simplices: vec![FxHashSet::default(); coords.len()],
             vertices: coords,
-            simplices: HashSet::new(),
+            simplices: FxHashSet::default(),
             dim,
+            last_simplex: RwLock::new(None),
         };
         triangulation.add_simplex(seed_simplex)?;
 
@@ -533,15 +550,102 @@ impl Triangulation {
         Ok(indices.iter().map(|&idx| self.vertices[idx].clone()).collect())
     }
 
-    pub fn locate_point(&self, point: &[f64]) -> Result<Option<Simplex>, TriangulationError> {
-        self.validate_point_dim(point)?;
+    fn locate_point_scan(&self, point: &[f64]) -> Result<Option<Simplex>, TriangulationError> {
         for simplex in &self.simplices {
             let vertices = self.get_vertices(simplex)?;
             if geometry::point_in_simplex(point, &vertices, DEFAULT_EPS)? {
+                *self.last_simplex.write().unwrap() = Some(simplex.clone());
                 return Ok(Some(simplex.clone()));
             }
         }
         Ok(None)
+    }
+
+    fn barycentric_alpha_for_simplex(
+        &self,
+        simplex: &[usize],
+        point: &[f64],
+    ) -> Result<Vec<f64>, TriangulationError> {
+        let dim = point.len();
+        let x0 = &self.vertices[simplex[0]];
+        let mut matrix = vec![vec![0.0; dim]; dim];
+        let mut rhs = vec![0.0; dim];
+
+        for row in 0..dim {
+            rhs[row] = point[row] - x0[row];
+            for col in 0..dim {
+                matrix[row][col] = self.vertices[simplex[col + 1]][row] - x0[row];
+            }
+        }
+
+        let flat: Vec<f64> = matrix.iter().flat_map(|row| row.iter().copied()).collect();
+        let mat = nalgebra::DMatrix::from_row_slice(dim, dim, &flat);
+        let rhs = nalgebra::DVector::from_column_slice(&rhs);
+        mat.lu()
+            .solve(&rhs)
+            .map(|solution| solution.iter().copied().collect())
+            .ok_or_else(|| TriangulationError::Geometry(GeometryError::SingularMatrix))
+    }
+
+    fn next_simplex_in_walk(
+        &self,
+        simplex: &[usize],
+        point: &[f64],
+    ) -> Result<Option<Simplex>, TriangulationError> {
+        let alpha = self.barycentric_alpha_for_simplex(simplex, point)?;
+        let alpha0 = 1.0 - alpha.iter().sum::<f64>();
+
+        let mut worst_idx = 0;
+        let mut worst_value = alpha0;
+        for (idx, value) in alpha.iter().copied().enumerate() {
+            if value < worst_value {
+                worst_idx = idx + 1;
+                worst_value = value;
+            }
+        }
+
+        if worst_value >= -DEFAULT_EPS {
+            *self.last_simplex.write().unwrap() = Some(simplex.to_vec());
+            return Ok(Some(simplex.to_vec()));
+        }
+
+        let mut face = Vec::with_capacity(self.dim);
+        for (idx, &vertex) in simplex.iter().enumerate() {
+            if idx != worst_idx {
+                face.push(vertex);
+            }
+        }
+
+        let mut neighbours = self.containing(&face)?;
+        neighbours.remove(simplex);
+        Ok(neighbours.into_iter().next())
+    }
+
+    pub fn locate_point(&self, point: &[f64]) -> Result<Option<Simplex>, TriangulationError> {
+        self.validate_point_dim(point)?;
+        let Some(mut current) = self
+            .last_simplex
+            .read()
+            .unwrap()
+            .clone()
+            .filter(|simplex| self.simplices.contains(simplex))
+            .or_else(|| self.simplices.iter().next().cloned())
+        else {
+            return Ok(None);
+        };
+
+        let mut visited = FxHashSet::default();
+        while visited.insert(current.clone()) {
+            match self.next_simplex_in_walk(&current, point) {
+                Ok(Some(next)) if next == current => return Ok(Some(current)),
+                Ok(Some(next)) => current = next,
+                Ok(None) => return Ok(None),
+                Err(TriangulationError::Geometry(GeometryError::SingularMatrix)) => break,
+                Err(err) => return Err(err),
+            }
+        }
+
+        self.locate_point_scan(point)
     }
 
     pub fn get_reduced_simplex(
@@ -562,8 +666,7 @@ impl Triangulation {
             simplex.to_vec()
         };
 
-        let vertices = self.get_vertices(&simplex)?;
-        let alpha = barycentric_alpha(&vertices, point)?;
+        let alpha = self.barycentric_alpha_for_simplex(&simplex, point)?;
         let sum_alpha = alpha.iter().sum::<f64>();
 
         if alpha.iter().any(|value| *value < -eps) || sum_alpha > 1.0 + eps {
@@ -594,8 +697,8 @@ impl Triangulation {
     pub fn faces(
         &self,
         dim: Option<usize>,
-        simplices: Option<&HashSet<Simplex>>,
-        vertices: Option<&HashSet<usize>>,
+        simplices: Option<&FxHashSet<Simplex>>,
+        vertices: Option<&FxHashSet<usize>>,
     ) -> Result<Vec<Simplex>, TriangulationError> {
         if simplices.is_some() && vertices.is_some() {
             return Err(TriangulationError::Value(
@@ -605,7 +708,7 @@ impl Triangulation {
 
         let face_size = dim.unwrap_or(self.dim);
         let simplex_pool: Vec<Simplex> = if let Some(vertices) = vertices {
-            let mut pool = HashSet::new();
+            let mut pool = FxHashSet::default();
             for &vertex in vertices {
                 self.validate_vertex_index(vertex)?;
                 pool.extend(self.vertex_to_simplices[vertex].iter().cloned());
@@ -636,13 +739,21 @@ impl Triangulation {
         }
     }
 
-    pub fn containing(&self, face: &[usize]) -> Result<HashSet<Simplex>, TriangulationError> {
+    pub fn containing(&self, face: &[usize]) -> Result<FxHashSet<Simplex>, TriangulationError> {
         if face.is_empty() {
-            return Ok(HashSet::new());
+            return Ok(FxHashSet::default());
         }
         self.validate_simplex_indices(face)?;
-        let mut result = self.vertex_to_simplices[face[0]].clone();
-        for &vertex in &face[1..] {
+        let mut face_vertices = face.iter().copied();
+        let first_vertex = face_vertices
+            .by_ref()
+            .min_by_key(|vertex| self.vertex_to_simplices[*vertex].len())
+            .unwrap();
+        let mut result = self.vertex_to_simplices[first_vertex].clone();
+        for &vertex in face {
+            if vertex == first_vertex {
+                continue;
+            }
             result.retain(|simplex| self.vertex_to_simplices[vertex].contains(simplex));
         }
         Ok(result)
@@ -693,7 +804,7 @@ impl Triangulation {
         pt_index: usize,
         containing_simplex: Option<Simplex>,
         transform: &Option<Vec<Vec<f64>>>,
-    ) -> Result<(HashSet<Simplex>, HashSet<Simplex>), TriangulationError> {
+    ) -> Result<(FxHashSet<Simplex>, FxHashSet<Simplex>), TriangulationError> {
         validate_transform(transform, self.dim)?;
         self.validate_vertex_index(pt_index)?;
         if let Some(simplex) = &containing_simplex {
@@ -701,9 +812,9 @@ impl Triangulation {
         }
 
         let mut queue = VecDeque::new();
-        let mut queued = HashSet::new();
-        let mut done_simplices = HashSet::new();
-        let mut bad_triangles = HashSet::new();
+        let mut queued = FxHashSet::default();
+        let mut done_simplices = FxHashSet::default();
+        let mut bad_triangles = FxHashSet::default();
 
         if let Some(simplex) = containing_simplex {
             queued.insert(simplex.clone());
@@ -728,8 +839,8 @@ impl Triangulation {
                 self.delete_simplex(&simplex)?;
                 bad_triangles.insert(simplex.clone());
 
-                let simplex_vertices: HashSet<usize> = simplex.iter().copied().collect();
-                let mut neighbours = HashSet::new();
+                let simplex_vertices: FxHashSet<usize> = simplex.iter().copied().collect();
+                let mut neighbours = FxHashSet::default();
                 for &vertex in &simplex {
                     neighbours.extend(self.vertex_to_simplices[vertex].iter().cloned());
                 }
@@ -750,7 +861,7 @@ impl Triangulation {
         }
 
         let faces = self.faces(None, Some(&bad_triangles), None)?;
-        let mut multiplicities: HashMap<Simplex, usize> = HashMap::new();
+        let mut multiplicities: FxHashMap<Simplex, usize> = FxHashMap::default();
         for face in &faces {
             *multiplicities.entry(face.clone()).or_insert(0) += 1;
         }
@@ -774,9 +885,9 @@ impl Triangulation {
         }
 
         let new_triangles = self.vertex_to_simplices[pt_index].clone();
-        let deleted_simplices: HashSet<Simplex> =
+        let deleted_simplices: FxHashSet<Simplex> =
             bad_triangles.difference(&new_triangles).cloned().collect();
-        let new_simplices: HashSet<Simplex> =
+        let new_simplices: FxHashSet<Simplex> =
             new_triangles.difference(&bad_triangles).cloned().collect();
 
         let old_vol = deleted_simplices.iter().try_fold(0.0, |acc, simplex| {
@@ -794,10 +905,10 @@ impl Triangulation {
         Ok((deleted_simplices, new_simplices))
     }
 
-    pub fn extend_hull(&mut self, pt_index: usize) -> Result<HashSet<Simplex>, TriangulationError> {
+    pub fn extend_hull(&mut self, pt_index: usize) -> Result<FxHashSet<Simplex>, TriangulationError> {
         self.validate_vertex_index(pt_index)?;
         let faces = self.faces(None, None, None)?;
-        let mut multiplicities: HashMap<Simplex, usize> = HashMap::new();
+        let mut multiplicities: FxHashMap<Simplex, usize> = FxHashMap::default();
         for face in &faces {
             *multiplicities.entry(face.clone()).or_insert(0) += 1;
         }
@@ -809,7 +920,7 @@ impl Triangulation {
         let hull_points: Vec<Vec<f64>> = hull_faces
             .iter()
             .flat_map(|face| face.iter().copied())
-            .collect::<HashSet<_>>()
+            .collect::<FxHashSet<_>>()
             .into_iter()
             .map(|idx| self.vertices[idx].clone())
             .collect();
@@ -824,7 +935,7 @@ impl Triangulation {
         }
 
         let new_vertex = self.vertices[pt_index].clone();
-        let mut new_simplices = HashSet::new();
+        let mut new_simplices = FxHashSet::default();
 
         for face in hull_faces {
             let pts_face = self.get_vertices(&face)?;
@@ -857,7 +968,7 @@ impl Triangulation {
         point: Vec<f64>,
         simplex: Option<Simplex>,
         transform: Option<Vec<Vec<f64>>>,
-    ) -> Result<(HashSet<Simplex>, HashSet<Simplex>), TriangulationError> {
+    ) -> Result<(FxHashSet<Simplex>, FxHashSet<Simplex>), TriangulationError> {
         self.validate_point_dim(&point)?;
         validate_transform(&transform, self.dim)?;
 
@@ -866,7 +977,7 @@ impl Triangulation {
             None => self.locate_point(&point)?.unwrap_or_default(),
         };
         let actual_simplex = simplex.clone();
-        self.vertex_to_simplices.push(HashSet::new());
+        self.vertex_to_simplices.push(FxHashSet::default());
 
         if simplex.is_empty() {
             self.vertices.push(point);
@@ -882,7 +993,7 @@ impl Triangulation {
             let (deleted_simplices, added_simplices) =
                 self.bowyer_watson(pt_index, None, &transform)?;
 
-            let deleted: HashSet<Simplex> = deleted_simplices
+            let deleted: FxHashSet<Simplex> = deleted_simplices
                 .difference(&temporary_simplices)
                 .cloned()
                 .collect();
@@ -945,9 +1056,9 @@ impl Triangulation {
         true
     }
 
-    pub fn hull(&self) -> Result<HashSet<usize>, TriangulationError> {
+    pub fn hull(&self) -> Result<FxHashSet<usize>, TriangulationError> {
         let faces = self.faces(None, None, None)?;
-        let mut counts: HashMap<Simplex, usize> = HashMap::new();
+        let mut counts: FxHashMap<Simplex, usize> = FxHashMap::default();
         for face in faces {
             let count = counts.entry(face).or_insert(0);
             *count += 1;
@@ -959,7 +1070,7 @@ impl Triangulation {
             }
         }
 
-        let mut hull = HashSet::new();
+        let mut hull = FxHashSet::default();
         for (face, count) in counts {
             if count == 1 {
                 hull.extend(face);
