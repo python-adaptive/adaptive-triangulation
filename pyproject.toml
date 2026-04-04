@@ -4,16 +4,22 @@ build-backend = "maturin"
 
 [project]
 name = "adaptive-triangulation"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Fast N-dimensional Delaunay triangulation with incremental point insertion"
 readme = "README.md"
+authors = [{ name = "python-adaptive contributors" }]
 license = "BSD-3-Clause"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Mathematics",
@@ -27,9 +33,26 @@ test = ["pytest>=7.0", "scipy>=1.10"]
 
 [project.urls]
 Homepage = "https://github.com/python-adaptive/adaptive-triangulation"
+Issues = "https://github.com/python-adaptive/adaptive-triangulation/issues"
 Repository = "https://github.com/python-adaptive/adaptive-triangulation"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "python"
 module-name = "adaptive_triangulation._rust"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = ["D", "COM812", "ISC001"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "PLR2004", "ANN"]
+"benchmarks/*" = ["T201", "ANN", "S101"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
