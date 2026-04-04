@@ -33,3 +33,19 @@ Repository = "https://github.com/python-adaptive/adaptive-triangulation"
 features = ["pyo3/extension-module"]
 python-source = "python"
 module-name = "adaptive_triangulation._rust"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = ["D", "COM812", "ISC001"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "PLR2004", "ANN"]
+"benchmarks/*" = ["T201", "ANN", "S101"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"

@@ -22,9 +22,8 @@ Usage::
 
 from __future__ import annotations
 
-from adaptive_triangulation._rust import (
+from ._rust import (
     Triangulation,
-    __version__ as __version__,
     circumsphere,
     fast_2d_circumcircle,
     fast_2d_point_in_simplex,
@@ -36,8 +35,11 @@ from adaptive_triangulation._rust import (
     simplex_volume_in_embedding,
     volume,
 )
+from ._rust import (
+    __version__ as __version__,
+)
 
-__all__ = [
+__all__: list[str] = [
     "Triangulation",
     "__version__",
     "circumsphere",
