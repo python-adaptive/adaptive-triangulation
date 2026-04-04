@@ -126,11 +126,7 @@ pub fn matrix_rank(vectors: &[Vec<f64>], tol: f64) -> Result<usize, GeometryErro
     let rows = vectors.len();
     let flat: Vec<f64> = vectors.iter().flat_map(|row| row.iter().copied()).collect();
     let svd = DMatrix::from_row_slice(rows, cols, &flat).svd(false, false);
-    let max_singular = svd
-        .singular_values
-        .iter()
-        .copied()
-        .fold(0.0_f64, f64::max);
+    let max_singular = svd.singular_values.iter().copied().fold(0.0_f64, f64::max);
     let tol = if tol.is_sign_positive() {
         tol
     } else {
@@ -155,24 +151,25 @@ pub fn fast_2d_point_in_simplex(
     let [[p0x, p0y], [p1x, p1y], [p2x, p2y]] = *simplex;
     let [px, py] = *point;
 
-    let area: f64 = 0.5
-        * (-p1y * p2x + p0y * (p2x - p1x) + p1x * p2y + p0x * (p1y - p2y));
+    let area: f64 = 0.5 * (-p1y * p2x + p0y * (p2x - p1x) + p1x * p2y + p0x * (p1y - p2y));
     if area == 0.0 {
         return Err(GeometryError::DegenerateSimplex);
     }
 
-    let s = 1.0 / (2.0 * area)
-        * (p0y * p2x + (p2y - p0y) * px - p0x * p2y + (p0x - p2x) * py);
+    let s = 1.0 / (2.0 * area) * (p0y * p2x + (p2y - p0y) * px - p0x * p2y + (p0x - p2x) * py);
     if s < -eps || s > 1.0 + eps {
         return Ok(false);
     }
 
-    let t = 1.0 / (2.0 * area)
-        * (p0x * p1y + (p0y - p1y) * px - p0y * p1x + (p1x - p0x) * py);
+    let t = 1.0 / (2.0 * area) * (p0x * p1y + (p0y - p1y) * px - p0y * p1x + (p1x - p0x) * py);
     Ok(t >= -eps && s + t <= 1.0 + eps)
 }
 
-pub fn point_in_simplex(point: &[f64], simplex: &[Vec<f64>], eps: f64) -> Result<bool, GeometryError> {
+pub fn point_in_simplex(
+    point: &[f64],
+    simplex: &[Vec<f64>],
+    eps: f64,
+) -> Result<bool, GeometryError> {
     if simplex.is_empty() || simplex.len() != point.len() + 1 {
         return Err(GeometryError::InvalidDimensions(
             "Simplex dimension mismatch".to_string(),
@@ -247,14 +244,10 @@ pub fn fast_3d_circumsphere(points: &[[f64; 3]; 4]) -> ([f64; 3], f64) {
     let l2 = x2 * x2 + y2 * y2 + z2 * z2;
     let l3 = x3 * x3 + y3 * y3 + z3 * z3;
 
-    let dx = l1 * (y2 * z3 - z2 * y3) - l2 * (y1 * z3 - z1 * y3)
-        + l3 * (y1 * z2 - z1 * y2);
-    let dy = l1 * (x2 * z3 - z2 * x3) - l2 * (x1 * z3 - z1 * x3)
-        + l3 * (x1 * z2 - z1 * x2);
-    let dz = l1 * (x2 * y3 - y2 * x3) - l2 * (x1 * y3 - y1 * x3)
-        + l3 * (x1 * y2 - y1 * x2);
-    let aa = x1 * (y2 * z3 - z2 * y3) - x2 * (y1 * z3 - z1 * y3)
-        + x3 * (y1 * z2 - z1 * y2);
+    let dx = l1 * (y2 * z3 - z2 * y3) - l2 * (y1 * z3 - z1 * y3) + l3 * (y1 * z2 - z1 * y2);
+    let dy = l1 * (x2 * z3 - z2 * x3) - l2 * (x1 * z3 - z1 * x3) + l3 * (x1 * z2 - z1 * x2);
+    let dz = l1 * (x2 * y3 - y2 * x3) - l2 * (x1 * y3 - y1 * x3) + l3 * (x1 * y2 - y1 * x2);
+    let aa = x1 * (y2 * z3 - z2 * y3) - x2 * (y1 * z3 - z1 * y3) + x3 * (y1 * z2 - z1 * y2);
     let a = 2.0 * aa;
 
     let cx = dx / a;
@@ -344,8 +337,8 @@ fn slogdet(matrix: &[Vec<f64>]) -> Result<(f64, f64), GeometryError> {
     for pivot_col in 0..n {
         let mut pivot_row = pivot_col;
         let mut pivot_abs = work[pivot_col][pivot_col].abs();
-        for row in (pivot_col + 1)..n {
-            let candidate = work[row][pivot_col].abs();
+        for (row, values) in work.iter().enumerate().skip(pivot_col + 1) {
+            let candidate = values[pivot_col].abs();
             if candidate > pivot_abs {
                 pivot_abs = candidate;
                 pivot_row = row;
@@ -368,11 +361,12 @@ fn slogdet(matrix: &[Vec<f64>]) -> Result<(f64, f64), GeometryError> {
         sign *= pivot.signum();
         log_abs_det += pivot.abs().ln();
 
-        for row in (pivot_col + 1)..n {
-            let factor = work[row][pivot_col] / pivot;
-            work[row][pivot_col] = 0.0;
-            for col in (pivot_col + 1)..n {
-                work[row][col] -= factor * work[pivot_col][col];
+        let pivot_values = work[pivot_col].clone();
+        for row_values in work.iter_mut().skip(pivot_col + 1) {
+            let factor = row_values[pivot_col] / pivot;
+            row_values[pivot_col] = 0.0;
+            for (col, value) in row_values.iter_mut().enumerate().skip(pivot_col + 1) {
+                *value -= factor * pivot_values[col];
             }
         }
     }
@@ -450,9 +444,11 @@ pub fn simplex_volume_in_embedding(vertices: &[Vec<f64>]) -> Result<f64, Geometr
 
     let n = vertices.len();
     let mut matrix = vec![vec![0.0; n + 1]; n + 1];
-    for idx in 1..=n {
-        matrix[0][idx] = 1.0;
-        matrix[idx][0] = 1.0;
+    for value in matrix[0].iter_mut().skip(1) {
+        *value = 1.0;
+    }
+    for row in matrix.iter_mut().skip(1) {
+        row[0] = 1.0;
     }
     for row in 0..n {
         for col in 0..n {

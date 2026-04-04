@@ -1,6 +1,11 @@
-target/
-.venv
-*.so
-*.dylib
-__pycache__/
 .claude/
+.mypy_cache/
+.venv
+/target/
+__pycache__/
+*.dylib
+*.egg-info/
+*.pyc
+*.pyd
+*.so
+dist/

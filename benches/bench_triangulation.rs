@@ -18,10 +18,12 @@ fn generate_points(dim: usize, count: usize, seed: u64) -> Vec<Vec<f64>> {
     for index in 0..count {
         let mut point = Vec::with_capacity(dim);
         for axis in 0..dim {
-            let low_discrepancy = ((index + 1) as f64 * (axis + 2) as f64 * 0.618_033_988_749_894_9)
-                .fract();
+            let low_discrepancy =
+                ((index + 1) as f64 * (axis + 2) as f64 * 0.618_033_988_749_894_9).fract();
             let jitter = next_unit_f64(&mut state);
-            point.push(0.7 * low_discrepancy + 0.3 * jitter + axis as f64 * 1e-4 + index as f64 * 1e-12);
+            point.push(
+                0.7 * low_discrepancy + 0.3 * jitter + axis as f64 * 1e-4 + index as f64 * 1e-12,
+            );
         }
         points.push(point);
     }
@@ -140,11 +142,7 @@ fn add_point_bench(c: &mut Criterion) {
 
 fn circumsphere_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("circumsphere");
-    let simplex_2d = vec![
-        vec![0.0, 0.0],
-        vec![0.9, 0.1],
-        vec![0.2, 0.8],
-    ];
+    let simplex_2d = vec![vec![0.0, 0.0], vec![0.9, 0.1], vec![0.2, 0.8]];
     let simplex_3d = vec![
         vec![0.0, 0.0, 0.0],
         vec![1.0, 0.1, 0.0],
@@ -174,7 +172,9 @@ fn point_in_circumcircle_bench(c: &mut Criterion) {
                 let mut current = triangulation.clone();
                 let pt_index = insert_pending_vertex(&mut current, point.clone());
                 let start = Instant::now();
-                let inside = current.point_in_circumcircle(pt_index, &simplex, &None).unwrap();
+                let inside = current
+                    .point_in_circumcircle(pt_index, &simplex, &None)
+                    .unwrap();
                 black_box(inside);
                 total += start.elapsed();
             }
@@ -198,7 +198,7 @@ fn locate_and_containing_benches(c: &mut Criterion) {
         .collect();
     let faces: Vec<Simplex> = simplices
         .iter()
-        .map(|simplex| simplex[..triangulation.dim].iter().copied().collect())
+        .map(|simplex| simplex[..triangulation.dim].to_vec())
         .collect();
 
     group.bench_function("locate_point", |b| {

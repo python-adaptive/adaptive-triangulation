@@ -7,13 +7,19 @@ name = "adaptive-triangulation"
 dynamic = ["version"]
 description = "Fast N-dimensional Delaunay triangulation with incremental point insertion"
 readme = "README.md"
+authors = [{ name = "python-adaptive contributors" }]
 license = "BSD-3-Clause"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Mathematics",
@@ -27,6 +33,7 @@ test = ["pytest>=7.0", "scipy>=1.10"]
 
 [project.urls]
 Homepage = "https://github.com/python-adaptive/adaptive-triangulation"
+Issues = "https://github.com/python-adaptive/adaptive-triangulation/issues"
 Repository = "https://github.com/python-adaptive/adaptive-triangulation"
 
 [tool.maturin]

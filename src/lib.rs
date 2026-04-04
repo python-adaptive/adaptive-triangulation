@@ -51,12 +51,10 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[pyfunction]
 #[pyo3(name = "circumsphere")]
-fn py_circumsphere(
-    py: Python<'_>,
-    points: &Bound<'_, PyAny>,
-) -> PyResult<(Py<PyTuple>, f64)> {
+fn py_circumsphere(py: Python<'_>, points: &Bound<'_, PyAny>) -> PyResult<(Py<PyTuple>, f64)> {
     let points = parse_points_sized(points, "Please provide a 2-dimensional list of points")?;
-    let (center, radius) = geom::circumsphere(&points).map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let (center, radius) =
+        geom::circumsphere(&points).map_err(|err| PyValueError::new_err(err.to_string()))?;
     Ok((point_tuple(py, &center), radius))
 }
 
