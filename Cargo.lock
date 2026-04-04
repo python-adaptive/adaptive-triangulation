@@ -10,6 +10,7 @@ dependencies = [
  "nalgebra",
  "numpy",
  "pyo3",
+ "rustc-hash",
  "thiserror",
 ]
 

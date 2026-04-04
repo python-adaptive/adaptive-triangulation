@@ -21,6 +21,7 @@ pyo3 = { version = "0.23", features = ["extension-module", "abi3-py311"] }
 numpy = "0.23"
 nalgebra = "0.33"
 thiserror = "2"
+rustc-hash = "2"
 
 [profile.release]
 lto = true
