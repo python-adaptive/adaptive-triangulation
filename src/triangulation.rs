@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::RwLock;
 
 use numpy::PyArray2;
 use pyo3::exceptions::{
@@ -343,12 +344,25 @@ fn is_close(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1e-8 + 1e-5 * b.abs()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Triangulation {
     pub vertices: Vec<Vec<f64>>,
     pub simplices: FxHashSet<Simplex>,
     pub vertex_to_simplices: Vec<FxHashSet<Simplex>>,
     pub dim: usize,
+    last_simplex: RwLock<Option<Simplex>>,
+}
+
+impl Clone for Triangulation {
+    fn clone(&self) -> Self {
+        Self {
+            vertices: self.vertices.clone(),
+            simplices: self.simplices.clone(),
+            vertex_to_simplices: self.vertex_to_simplices.clone(),
+            dim: self.dim,
+            last_simplex: RwLock::new(self.last_simplex.read().unwrap().clone()),
+        }
+    }
 }
 
 impl Triangulation {
@@ -449,6 +463,7 @@ impl Triangulation {
             vertices: coords,
             simplices: FxHashSet::default(),
             dim,
+            last_simplex: RwLock::new(None),
         };
         for simplex in simplices {
             triangulation.add_simplex(simplex)?;
@@ -466,6 +481,7 @@ impl Triangulation {
             vertices: coords,
             simplices: FxHashSet::default(),
             dim,
+            last_simplex: RwLock::new(None),
         };
         triangulation.add_simplex(seed_simplex)?;
 
@@ -534,15 +550,102 @@ impl Triangulation {
         Ok(indices.iter().map(|&idx| self.vertices[idx].clone()).collect())
     }
 
-    pub fn locate_point(&self, point: &[f64]) -> Result<Option<Simplex>, TriangulationError> {
-        self.validate_point_dim(point)?;
+    fn locate_point_scan(&self, point: &[f64]) -> Result<Option<Simplex>, TriangulationError> {
         for simplex in &self.simplices {
             let vertices = self.get_vertices(simplex)?;
             if geometry::point_in_simplex(point, &vertices, DEFAULT_EPS)? {
+                *self.last_simplex.write().unwrap() = Some(simplex.clone());
                 return Ok(Some(simplex.clone()));
             }
         }
         Ok(None)
+    }
+
+    fn barycentric_alpha_for_simplex(
+        &self,
+        simplex: &[usize],
+        point: &[f64],
+    ) -> Result<Vec<f64>, TriangulationError> {
+        let dim = point.len();
+        let x0 = &self.vertices[simplex[0]];
+        let mut matrix = vec![vec![0.0; dim]; dim];
+        let mut rhs = vec![0.0; dim];
+
+        for row in 0..dim {
+            rhs[row] = point[row] - x0[row];
+            for col in 0..dim {
+                matrix[row][col] = self.vertices[simplex[col + 1]][row] - x0[row];
+            }
+        }
+
+        let flat: Vec<f64> = matrix.iter().flat_map(|row| row.iter().copied()).collect();
+        let mat = nalgebra::DMatrix::from_row_slice(dim, dim, &flat);
+        let rhs = nalgebra::DVector::from_column_slice(&rhs);
+        mat.lu()
+            .solve(&rhs)
+            .map(|solution| solution.iter().copied().collect())
+            .ok_or_else(|| TriangulationError::Geometry(GeometryError::SingularMatrix))
+    }
+
+    fn next_simplex_in_walk(
+        &self,
+        simplex: &[usize],
+        point: &[f64],
+    ) -> Result<Option<Simplex>, TriangulationError> {
+        let alpha = self.barycentric_alpha_for_simplex(simplex, point)?;
+        let alpha0 = 1.0 - alpha.iter().sum::<f64>();
+
+        let mut worst_idx = 0;
+        let mut worst_value = alpha0;
+        for (idx, value) in alpha.iter().copied().enumerate() {
+            if value < worst_value {
+                worst_idx = idx + 1;
+                worst_value = value;
+            }
+        }
+
+        if worst_value >= -DEFAULT_EPS {
+            *self.last_simplex.write().unwrap() = Some(simplex.to_vec());
+            return Ok(Some(simplex.to_vec()));
+        }
+
+        let mut face = Vec::with_capacity(self.dim);
+        for (idx, &vertex) in simplex.iter().enumerate() {
+            if idx != worst_idx {
+                face.push(vertex);
+            }
+        }
+
+        let mut neighbours = self.containing(&face)?;
+        neighbours.remove(simplex);
+        Ok(neighbours.into_iter().next())
+    }
+
+    pub fn locate_point(&self, point: &[f64]) -> Result<Option<Simplex>, TriangulationError> {
+        self.validate_point_dim(point)?;
+        let Some(mut current) = self
+            .last_simplex
+            .read()
+            .unwrap()
+            .clone()
+            .filter(|simplex| self.simplices.contains(simplex))
+            .or_else(|| self.simplices.iter().next().cloned())
+        else {
+            return Ok(None);
+        };
+
+        let mut visited = FxHashSet::default();
+        while visited.insert(current.clone()) {
+            match self.next_simplex_in_walk(&current, point) {
+                Ok(Some(next)) if next == current => return Ok(Some(current)),
+                Ok(Some(next)) => current = next,
+                Ok(None) => return Ok(None),
+                Err(TriangulationError::Geometry(GeometryError::SingularMatrix)) => break,
+                Err(err) => return Err(err),
+            }
+        }
+
+        self.locate_point_scan(point)
     }
 
     pub fn get_reduced_simplex(
@@ -563,8 +666,7 @@ impl Triangulation {
             simplex.to_vec()
         };
 
-        let vertices = self.get_vertices(&simplex)?;
-        let alpha = barycentric_alpha(&vertices, point)?;
+        let alpha = self.barycentric_alpha_for_simplex(&simplex, point)?;
         let sum_alpha = alpha.iter().sum::<f64>();
 
         if alpha.iter().any(|value| *value < -eps) || sum_alpha > 1.0 + eps {
@@ -642,8 +744,16 @@ impl Triangulation {
             return Ok(FxHashSet::default());
         }
         self.validate_simplex_indices(face)?;
-        let mut result = self.vertex_to_simplices[face[0]].clone();
-        for &vertex in &face[1..] {
+        let mut face_vertices = face.iter().copied();
+        let first_vertex = face_vertices
+            .by_ref()
+            .min_by_key(|vertex| self.vertex_to_simplices[*vertex].len())
+            .unwrap();
+        let mut result = self.vertex_to_simplices[first_vertex].clone();
+        for &vertex in face {
+            if vertex == first_vertex {
+                continue;
+            }
             result.retain(|simplex| self.vertex_to_simplices[vertex].contains(simplex));
         }
         Ok(result)
