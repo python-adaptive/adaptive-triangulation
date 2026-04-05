@@ -1,17 +1,28 @@
 # adaptive-triangulation
 
-Fast N-dimensional Delaunay triangulation in Rust with Python bindings.
+[![CI](https://github.com/python-adaptive/adaptive-triangulation/actions/workflows/ci.yml/badge.svg)](https://github.com/python-adaptive/adaptive-triangulation/actions)
+[![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
-[![PyPI](https://img.shields.io/pypi/v/adaptive-triangulation)](https://pypi.org/project/adaptive-triangulation/)
-[![Python](https://img.shields.io/pypi/pyversions/adaptive-triangulation)](https://pypi.org/project/adaptive-triangulation/)
-[![License](https://img.shields.io/github/license/python-adaptive/adaptive-triangulation)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/python-adaptive/adaptive-triangulation/ci.yml)](https://github.com/python-adaptive/adaptive-triangulation/actions)
-[![Downloads](https://img.shields.io/pypi/dm/adaptive-triangulation)](https://pypi.org/project/adaptive-triangulation/)
+Fast N-dimensional Delaunay triangulation in Rust with Python bindings (PyO3).
+Drop-in replacement for [adaptive](https://github.com/python-adaptive/adaptive)'s `Triangulation` class — **5-99× faster**.
 
-`adaptive-triangulation` is a Rust/PyO3 implementation of the incremental Bowyer-Watson
-algorithm for Delaunay triangulation. It is designed as a fast drop-in triangulation backend for
-`adaptive`, while remaining useful as a standalone computational geometry package for 2D, 3D, and
-higher-dimensional point sets.
+## Performance
+
+### Standalone triangulation (incremental insertion)
+| Case | Rust | Python | Speedup |
+|---|---:|---:|---:|
+| 2D, 1K pts | 38.5 ms | 668 ms | **17×** |
+| 2D, 5K pts | 260 ms | 8,547 ms | **33×** |
+| 3D, 500 pts | 133 ms | 5,571 ms | **42×** |
+
+### LearnerND integration (end-to-end, `ring_of_fire` 2D)
+| N pts | Learner2D (scipy) | LearnerND (Python) | LearnerND (Rust) |
+|---|---:|---:|---:|
+| 1,000 | 0.34 s | 0.91 s | **0.23 s** |
+| 2,000 | 1.17 s | 1.80 s | **0.38 s** |
+| 5,000 | 6.99 s | 4.57 s | **0.99 s** |
+
+LearnerND + Rust is **5× faster** than LearnerND + Python, and **7× faster** than Learner2D at 5K points.
 
 ## Installation
 
@@ -19,106 +30,101 @@ higher-dimensional point sets.
 pip install adaptive-triangulation
 ```
 
-## Quick Start
+Requires a Rust toolchain for building from source. Pre-built wheels are available for common platforms via CI.
+
+## Quick start
+
+```python
+from adaptive_triangulation import Triangulation
+
+# Build a 2D triangulation
+tri = Triangulation([(0, 0), (1, 0), (0, 1), (1, 1)])
+
+# Insert points incrementally (Bowyer-Watson)
+deleted, added = tri.add_point((0.5, 0.5))
+
+# Query properties
+print(len(tri.simplices))     # number of triangles
+print(tri.dim)                # 2
+print(tri.reference_invariant())  # True
+```
+
+## Usage with adaptive's LearnerND
+
+This is a drop-in replacement for `adaptive`'s built-in triangulation.
+Monkey-patch the module to use Rust triangulation everywhere:
 
 ```python
 import adaptive_triangulation as at
-import numpy as np
+from adaptive.learner import learnerND as lnd_mod
+from adaptive.learner.learnerND import LearnerND
 
-# 2D triangulation
-points = [[0, 0], [1, 0], [0, 1], [1, 1], [0.5, 0.5]]
-tri = at.Triangulation(points)
-print(f"Simplices: {tri.simplices}")
+# Replace both the class and standalone functions
+lnd_mod.Triangulation = at.Triangulation
+lnd_mod.circumsphere = at.circumsphere
+lnd_mod.simplex_volume_in_embedding = at.simplex_volume_in_embedding
+lnd_mod.point_in_simplex = at.point_in_simplex
 
-# Incremental point insertion
-deleted, added = tri.add_point((0.25, 0.75))
-print(f"Deleted simplices: {deleted}")
-print(f"Added simplices: {added}")
-
-# Circumsphere queries
-for simplex in tri.simplices:
-    center, radius = tri.circumscribed_circle(simplex)
-    print(simplex, center, radius)
-
-# Works in any dimension
-points_3d = np.random.rand(10, 3).tolist()
-tri3d = at.Triangulation(points_3d)
-print(f"3D simplices: {len(tri3d.simplices)}")
+# Now use LearnerND as normal — it's 5× faster
+learner = LearnerND(my_function, bounds=[(-1, 1), (-1, 1)])
 ```
 
-Standalone geometry helpers are also available:
+See [`examples/adaptive_learnernd.py`](examples/adaptive_learnernd.py) for a full working example with timing comparison.
+
+## API
+
+### `Triangulation` class
 
 ```python
-import adaptive_triangulation as at
-
-triangle = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
-center, radius = at.circumsphere(triangle)
-inside = at.point_in_simplex([0.25, 0.25], triangle)
-area = at.volume(triangle)
+tri = Triangulation(coords)           # Build from initial points
+tri.add_point(point)                   # Incremental insertion → (deleted, added)
+tri.locate_point(point)                # Find containing simplex
+tri.circumscribed_circle(simplex)      # → (center, radius)
+tri.volume(simplex)                    # Simplex volume
+tri.volumes()                          # All simplex volumes
+tri.point_in_simplex(point, simplex)   # Containment test
+tri.point_in_circumcircle(pt, simplex) # Circumcircle test
+tri.bowyer_watson(pt_index)            # Direct Bowyer-Watson
+tri.reference_invariant()              # Consistency check
 ```
 
-## Performance
-
-The table below compares release-mode `adaptive-triangulation` against the Python reference
-implementation used in the test suite on the same machine. Each case builds a triangulation from a
-minimal seed simplex and inserts the remaining points incrementally.
-
-| Case | Rust (`maturin develop --release`) | Python reference | Speedup |
-| --- | ---: | ---: | ---: |
-| 2D, 1,000 points | 38.5 ms | 668.1 ms | 17.4x |
-| 2D, 5,000 points | 259.8 ms | 8547.2 ms | 32.9x |
-| 3D, 500 points | 133.4 ms | 5570.9 ms | 41.8x |
-
-Absolute timings will vary by machine, but the release build consistently outperforms the pure
-Python reference by a wide margin on construction and incremental insertion workloads.
-
-## API Reference
-
-### Module attributes
-
-- `__version__`: Package version sourced from `Cargo.toml`.
-
-### `Triangulation`
-
-- `Triangulation(coords)`: Build an N-dimensional Delaunay triangulation from points in general position.
-- `add_point(point, simplex=None, transform=None)`: Insert one point and return `(deleted_simplices, added_simplices)`.
-- `add_simplex(simplex)`: Insert a simplex directly into the triangulation state.
-- `delete_simplex(simplex)`: Remove a simplex from the triangulation state.
-- `locate_point(point)`: Return the simplex containing a query point, or an empty tuple when none is found.
-- `get_reduced_simplex(point, simplex, eps=1e-8)`: Reduce a simplex to the smallest face containing the point.
-- `circumscribed_circle(simplex, transform=None)`: Compute the circumsphere center and radius for a simplex.
-- `point_in_circumcircle(pt_index, simplex, transform=None)`: Check whether a stored vertex lies inside a simplex circumsphere.
-- `point_in_cicumcircle(pt_index, simplex, transform=None)`: Legacy alias for `point_in_circumcircle`.
-- `point_in_simplex(point, simplex, eps=1e-8)`: Test whether a point lies inside a simplex.
-- `volume(simplex)`: Compute the volume of one simplex by vertex index.
-- `volumes()`: Return the volumes of all simplices in the triangulation.
-- `faces(dim=None, simplices=None, vertices=None)`: Iterate over faces filtered by dimension, simplices, or vertices.
-- `containing(face)`: Return the simplices that contain a face.
-- `get_vertices(indices)`: Fetch vertex coordinates for a sequence of vertex indices.
-- `bowyer_watson(pt_index, containing_simplex=None, transform=None)`: Run one Bowyer-Watson insertion step for an existing vertex.
-- `reference_invariant()`: Check internal consistency against the reference invariants used by the tests.
-- `vertex_invariant(vertex)`: Compatibility placeholder that currently raises `NotImplementedError`.
-- `convex_invariant(vertex)`: Compatibility placeholder that currently raises `NotImplementedError`.
-- `vertices`: Vertex coordinates stored by the triangulation.
-- `simplices`: Set of simplices represented as tuples of vertex indices.
-- `vertex_to_simplices`: Reverse map from vertex index to incident simplices.
-- `hull`: Set of vertex indices on the convex hull.
-- `dim`: Spatial dimension of the triangulation.
-- `default_transform`: Identity metric transform for the current dimension.
+**Properties:** `vertices`, `simplices`, `vertex_to_simplices`, `hull`, `dim`, `default_transform`
 
 ### Standalone functions
 
-- `circumsphere(points)`: Compute the circumsphere of a simplex given explicit coordinates.
-- `fast_2d_circumcircle(points)`: Fast circumcircle routine specialized for three 2D points.
-- `fast_3d_circumsphere(points)`: Fast circumsphere routine specialized for four 3D points.
-- `fast_3d_circumcircle(points)`: Alias for the 3D circumsphere helper.
-- `point_in_simplex(point, simplex, eps=1e-8)`: Generic point-in-simplex predicate.
-- `fast_2d_point_in_simplex(point, simplex, eps=1e-8)`: Fast 2D point-in-triangle predicate.
-- `volume(simplex)`: Compute the volume of a simplex from coordinates.
-- `simplex_volume_in_embedding(vertices)`: Compute simplex volume in a higher-dimensional embedding space.
-- `orientation(face, origin)`: Return the orientation of a face relative to an origin point.
-- `fast_norm(point)`: Compute the Euclidean norm of a point.
+```python
+from adaptive_triangulation import (
+    circumsphere,              # General circumsphere
+    fast_2d_circumcircle,      # Optimized 2D
+    fast_3d_circumsphere,      # Optimized 3D
+    point_in_simplex,          # Containment test
+    volume,                    # Simplex volume
+    simplex_volume_in_embedding,  # Volume in embedding space
+    orientation,               # Face orientation
+)
+```
+
+## Examples
+
+- [`examples/basic_usage.py`](examples/basic_usage.py) — Core API walkthrough
+- [`examples/adaptive_learnernd.py`](examples/adaptive_learnernd.py) — LearnerND integration with timing
+- [`examples/benchmark_vs_python.py`](examples/benchmark_vs_python.py) — Standalone benchmarks across dimensions
+
+## Development
+
+```bash
+# Build (requires Rust toolchain)
+pip install maturin
+maturin develop --release
+
+# Tests
+cargo test                    # Rust tests
+python -m pytest tests/ -v    # Python tests
+
+# Linting
+pre-commit run --all-files    # ruff, mypy, cargo fmt, cargo clippy
+```
 
 ## License
 
-BSD-3-Clause, matching the `adaptive` project. See [LICENSE](LICENSE).
+BSD-3-Clause
