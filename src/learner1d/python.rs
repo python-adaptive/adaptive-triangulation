@@ -144,9 +144,9 @@ impl PyLearner1D {
         Ok(n_evaluated)
     }
 
-    #[getter]
-    fn loss(&self) -> f64 {
-        self.inner.loss(true)
+    #[pyo3(signature = (real=true))]
+    fn loss(&self, real: bool) -> f64 {
+        self.inner.loss(real)
     }
 
     #[getter]
@@ -215,7 +215,8 @@ impl PyLearner1D {
     #[getter]
     fn data<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
         let dict = pyo3::types::PyDict::new(py);
-        for (&x, y) in &self.inner.data {
+        // Include both in-bounds and out-of-bounds data (matches Python behavior)
+        for (&x, y) in self.inner.data.iter().chain(self.inner.out_of_bounds_data.iter()) {
             let key = x.into_inner();
             let val: PyObject = match y {
                 YValue::Scalar(v) => v.into_pyobject(py)?.into_any().unbind(),

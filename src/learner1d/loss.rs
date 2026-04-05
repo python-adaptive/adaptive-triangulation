@@ -279,12 +279,16 @@ fn python_callback_loss(
             .collect();
         let xs_tuple = pyo3::types::PyTuple::new(py, &xs_py).unwrap();
         let ys_tuple = pyo3::types::PyTuple::new(py, &ys_py).unwrap();
-        let result = callback
-            .call1(py, (xs_tuple, ys_tuple))
-            .expect("Python loss callback failed");
-        result
-            .extract::<f64>(py)
-            .expect("Loss callback must return float")
+        match callback.call1(py, (xs_tuple, ys_tuple)) {
+            Ok(result) => result.extract::<f64>(py).unwrap_or_else(|e| {
+                e.print(py);
+                f64::INFINITY
+            }),
+            Err(err) => {
+                err.print(py);
+                f64::INFINITY
+            }
+        }
     })
 }
 
