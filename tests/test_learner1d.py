@@ -57,7 +57,7 @@ class TestBasic:
         l = Learner1D(bounds=(0.0, 1.0))
         l.tell(0.0, 0.0)
         l.tell(1.0, 1.0)
-        loss = l.loss
+        loss = l.loss()
         # default_loss = sqrt(dx^2 + dy^2) with scaling
         # dx_scaled = 1/1 = 1, dy_scaled = 1/1 = 1 → sqrt(2) ≈ 1.414
         assert abs(loss - math.sqrt(2)) < 1e-10
@@ -98,7 +98,7 @@ class TestBasic:
 
     def test_loss_starts_infinite(self):
         l = Learner1D(bounds=(0.0, 1.0))
-        assert math.isinf(l.loss)
+        assert math.isinf(l.loss())
 
 
 # ---- tell_many ----
@@ -118,7 +118,7 @@ class TestTellMany:
         ys = [x**2 for x in xs]
         l.tell_many(xs, ys, force=True)
         assert l.npoints == 11
-        assert not math.isinf(l.loss)
+        assert not math.isinf(l.loss())
 
     def test_large_batch_triggers_rebuild(self):
         """When len(xs) > 0.5 * len(data) and len(xs) > 2, rebuild path is used."""
@@ -222,7 +222,7 @@ class TestRun:
     def test_run_with_goal(self):
         l = Learner1D(bounds=(-1.0, 1.0))
         n = l.run(parabola, goal=0.01, batch_size=10)
-        assert l.loss <= 0.01
+        assert l.loss() <= 0.01
         assert n > 0
 
     def test_run_batch_size_1(self):
@@ -280,10 +280,10 @@ class TestRemoveUnfinished:
         l = Learner1D(bounds=(0.0, 1.0))
         l.tell(0.0, 0.0)
         l.tell(1.0, 1.0)
-        loss_before = l.loss
+        loss_before = l.loss()
         l.ask(5, tell_pending=True)
         l.remove_unfinished()
-        loss_after = l.loss
+        loss_after = l.loss()
         assert abs(loss_before - loss_after) < 1e-10
 
 
@@ -295,14 +295,14 @@ class TestEdgeCases:
         l = Learner1D(bounds=(0.0, 1.0))
         l.tell(0.0, 0.0)
         assert l.npoints == 1
-        assert math.isinf(l.loss)
+        assert math.isinf(l.loss())
 
     def test_tell_at_bounds(self):
         l = Learner1D(bounds=(0.0, 1.0))
         l.tell(0.0, 0.0)
         l.tell(1.0, 1.0)
         assert l.npoints == 2
-        assert not math.isinf(l.loss)
+        assert not math.isinf(l.loss())
 
     def test_ask_zero(self):
         l = Learner1D(bounds=(0.0, 1.0))
@@ -329,11 +329,11 @@ class TestScaleDoubling:
         l = Learner1D(bounds=(0.0, 1.0))
         l.tell(0.0, 0.0)
         l.tell(1.0, 1.0)
-        loss1 = l.loss
+        loss1 = l.loss()
         # Tell a point with y far beyond current range → triggers scale change
         l.tell(0.5, 100.0)
         # Loss should change because scale changed
-        loss2 = l.loss
+        loss2 = l.loss()
         assert loss1 != loss2
 
 
@@ -403,8 +403,8 @@ class TestNumerical:
         ys = [math.sin(x) for x in xs]
         l.tell_many(xs, ys, force=True)
         # Loss should be finite and non-negative
-        assert l.loss >= 0
-        assert math.isfinite(l.loss)
+        assert l.loss() >= 0
+        assert math.isfinite(l.loss())
 
     def test_tiny_interval(self):
         """Intervals near machine epsilon should have zero loss."""
@@ -414,7 +414,7 @@ class TestNumerical:
         l.tell(0.5 + eps, 1.0)
         # The tiny interval should have very small or zero loss
         # because dx < dx_eps
-        assert l.loss >= 0
+        assert l.loss() >= 0
 
 
 # ---- Cross-validation with adaptive loop ----
@@ -426,12 +426,12 @@ class TestAdaptiveLoop:
         l = Learner1D(bounds=(-1.0, 1.0))
         l.tell(-1.0, sin10(-1.0))
         l.tell(1.0, sin10(1.0))
-        losses = [l.loss]
+        losses = [l.loss()]
         for _ in range(50):
             pts, _ = l.ask(1, tell_pending=True)
             for p in pts:
                 l.tell(p, sin10(p))
-            losses.append(l.loss)
+            losses.append(l.loss())
         # Loss should generally decrease
         assert losses[-1] < losses[0]
 
@@ -445,8 +445,8 @@ class TestAdaptiveLoop:
 
         assert n1 == n2 == 50
         # Both should have reasonable loss
-        assert l1.loss < 0.1
-        assert l2.loss < 0.1
+        assert l1.loss() < 0.1
+        assert l2.loss() < 0.1
 
     def test_full_adaptive_loop(self):
         """Full adaptive loop should produce good point distribution."""
@@ -459,3 +459,142 @@ class TestAdaptiveLoop:
         # Check that function values match
         for x, y in zip(xs, ys):
             assert abs(y - sin10(x)) < 1e-10
+
+
+# ---- Out-of-bounds tells ----
+
+
+class TestOutOfBounds:
+    def test_oob_tell_does_not_affect_loss(self):
+        """Out-of-bounds data should not affect loss computation."""
+        l1 = Learner1D(bounds=(-1.0, 1.0))
+        l1.tell(-1.0, 0.0)
+        l1.tell(1.0, 0.0)
+        loss_before = l1.loss()
+
+        l2 = Learner1D(bounds=(-1.0, 1.0))
+        l2.tell(-1.0, 0.0)
+        l2.tell(1.0, 0.0)
+        l2.tell(-10.0, 999.0)  # Out of bounds
+        l2.tell(10.0, 999.0)  # Out of bounds
+        loss_after = l2.loss()
+
+        assert abs(loss_before - loss_after) < 1e-10
+
+    def test_oob_tell_stored_in_data(self):
+        """Out-of-bounds data should still be accessible via the data property."""
+        l = Learner1D(bounds=(-1.0, 1.0))
+        l.tell(-1.0, 0.0)
+        l.tell(5.0, 42.0)  # Out of bounds
+        d = l.data
+        assert 5.0 in d
+        assert d[5.0] == 42.0
+
+    def test_oob_tell_counted_in_npoints(self):
+        """Out-of-bounds tells should be counted in npoints."""
+        l = Learner1D(bounds=(-1.0, 1.0))
+        l.tell(-1.0, 0.0)
+        l.tell(5.0, 42.0)  # Out of bounds
+        assert l.npoints == 2
+
+    def test_oob_does_not_affect_neighbors(self):
+        """Out-of-bounds points should not appear as neighbors in loss intervals."""
+        l = Learner1D(bounds=(-1.0, 1.0))
+        l.tell(-10.0, 0.0)  # Out of bounds — should NOT become neighbor of -1.0
+        l.tell(-1.0, 0.0)
+        l.tell(1.0, 0.0)
+        ivals = l.intervals()
+        # Should only have one interval: (-1.0, 1.0)
+        assert len(ivals) == 1
+        assert ivals[0][0] == -1.0
+        assert ivals[0][1] == 1.0
+
+    def test_oob_duplicate_ignored(self):
+        """Telling the same OOB point twice should be ignored."""
+        l = Learner1D(bounds=(-1.0, 1.0))
+        l.tell(5.0, 1.0)
+        l.tell(5.0, 99.0)
+        assert l.npoints == 1
+        assert l.data[5.0] == 1.0
+
+
+# ---- Python callback exception handling ----
+
+
+class TestCallbackException:
+    def test_callback_exception_returns_infinity(self):
+        """A Python callback that raises should return inf loss, not crash."""
+        def bad_loss(xs, ys):
+            msg = "intentional error"
+            raise ValueError(msg)
+
+        l = Learner1D(bounds=(0.0, 1.0), loss_per_interval=bad_loss)
+        l.tell(0.0, 0.0)
+        l.tell(1.0, 1.0)
+        # Should not crash — loss should be infinity due to error
+        loss = l.loss()
+        assert math.isinf(loss)
+
+    def test_callback_wrong_return_type(self):
+        """A callback returning non-float should return inf loss, not crash."""
+        def string_loss(xs, ys):
+            return "not a float"
+
+        l = Learner1D(bounds=(0.0, 1.0), loss_per_interval=string_loss)
+        l.tell(0.0, 0.0)
+        l.tell(1.0, 1.0)
+        loss = l.loss()
+        assert math.isinf(loss)
+
+
+# ---- loss(real=False) parameter ----
+
+
+class TestLossRealParam:
+    def test_loss_real_true(self):
+        """loss(real=True) should return the real loss."""
+        l = Learner1D(bounds=(0.0, 1.0))
+        l.tell(0.0, 0.0)
+        l.tell(1.0, 1.0)
+        assert l.loss(real=True) == l.loss()
+
+    def test_loss_real_false_with_pending(self):
+        """loss(real=False) should account for pending points."""
+        l = Learner1D(bounds=(0.0, 1.0))
+        l.tell(0.0, 0.0)
+        l.tell(1.0, 1.0)
+        real_loss = l.loss(real=True)
+        l.tell_pending(0.5)
+        combined_loss = l.loss(real=False)
+        # Combined loss should be less than real loss because pending splits interval
+        assert combined_loss < real_loss
+
+    def test_loss_default_is_real(self):
+        """loss() with no args should default to real=True."""
+        l = Learner1D(bounds=(0.0, 1.0))
+        l.tell(0.0, 0.0)
+        l.tell(1.0, 1.0)
+        assert l.loss() == l.loss(real=True)
+
+
+# ---- Linspace endpoint fix ----
+
+
+class TestLinspaceEndpoint:
+    def test_empty_ask_includes_right_endpoint(self):
+        """ask(n) on empty learner should include both endpoints like np.linspace."""
+        l = Learner1D(bounds=(0.0, 1.0))
+        pts, _ = l.ask(3, tell_pending=False)
+        assert len(pts) == 3
+        # Should match np.linspace(0, 1, 3) = [0.0, 0.5, 1.0]
+        expected = [0.0, 0.5, 1.0]
+        for p, e in zip(sorted(pts), expected):
+            assert abs(p - e) < 1e-10
+
+    def test_empty_ask_5_points(self):
+        """ask(5) on empty learner should produce np.linspace(0, 1, 5)."""
+        l = Learner1D(bounds=(0.0, 1.0))
+        pts, _ = l.ask(5, tell_pending=False)
+        expected = [0.0, 0.25, 0.5, 0.75, 1.0]
+        for p, e in zip(sorted(pts), expected):
+            assert abs(p - e) < 1e-10

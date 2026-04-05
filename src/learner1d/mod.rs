@@ -1,7 +1,7 @@
 pub mod loss;
 pub mod python;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 
 use ordered_float::OrderedFloat;
@@ -23,6 +23,8 @@ pub enum YValue {
 pub struct Learner1D {
     // Core data
     pub(crate) data: BTreeMap<OF64, YValue>,
+    /// Data points outside bounds — stored separately so they don't affect neighbor queries.
+    pub(crate) out_of_bounds_data: HashMap<OF64, YValue>,
     pub(crate) pending: BTreeSet<OF64>,
     /// Union of `data` keys and `pending`.
     combined_points: BTreeSet<OF64>,
@@ -80,6 +82,34 @@ fn linspace_interior(left: f64, right: f64, n: usize) -> Vec<f64> {
     (1..n).map(|i| left + step * i as f64).collect()
 }
 
+/// Update y-min/y-max bounds from a single data point.
+fn update_y_bounds(y_min: &mut Vec<f64>, y_max: &mut Vec<f64>, y: &YValue) {
+    match y {
+        YValue::Scalar(v) => {
+            if y_min.is_empty() {
+                *y_min = vec![*v];
+                *y_max = vec![*v];
+            } else {
+                y_min[0] = y_min[0].min(*v);
+                y_max[0] = y_max[0].max(*v);
+            }
+        }
+        YValue::Vector(v) => {
+            if y_min.is_empty() {
+                *y_min = v.clone();
+                *y_max = v.clone();
+            } else {
+                for (i, val) in v.iter().enumerate() {
+                    if i < y_min.len() {
+                        y_min[i] = y_min[i].min(*val);
+                        y_max[i] = y_max[i].max(*val);
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Learner1D {
     // ----------------------------------------------------------------
     //  Construction
@@ -94,6 +124,7 @@ impl Learner1D {
         missing.insert(OF64::from(bounds.1));
         Self {
             data: BTreeMap::new(),
+            out_of_bounds_data: HashMap::new(),
             pending: BTreeSet::new(),
             combined_points: BTreeSet::new(),
             losses: LossManager::new(x_scale),
@@ -118,12 +149,9 @@ impl Learner1D {
 
     pub fn tell(&mut self, x: f64, y: YValue) {
         let xo = OF64::from(x);
-        if self.data.contains_key(&xo) {
+        if self.data.contains_key(&xo) || self.out_of_bounds_data.contains_key(&xo) {
             return;
         }
-        self.data.insert(xo, y.clone());
-        self.pending.remove(&xo);
-        self.combined_points.insert(xo);
 
         // Detect vdim from first data point
         if self.vdim.is_none() {
@@ -133,9 +161,15 @@ impl Learner1D {
             });
         }
 
+        self.pending.remove(&xo);
+
         if !(self.bounds.0 <= x && x <= self.bounds.1) {
+            self.out_of_bounds_data.insert(xo, y);
             return;
         }
+
+        self.data.insert(xo, y.clone());
+        self.combined_points.insert(xo);
 
         self.update_scale(&y);
         self.update_losses(xo, true);
@@ -181,8 +215,12 @@ impl Learner1D {
         // Fast rebuild path
         for (x, y) in xs.iter().zip(ys.iter()) {
             let xo = OF64::from(*x);
-            self.data.insert(xo, y.clone());
             self.pending.remove(&xo);
+            if !(self.bounds.0 <= *x && *x <= self.bounds.1) {
+                self.out_of_bounds_data.insert(xo, y.clone());
+            } else {
+                self.data.insert(xo, y.clone());
+            }
         }
 
         // Detect vdim
@@ -272,7 +310,7 @@ impl Learner1D {
     }
 
     pub fn npoints(&self) -> usize {
-        self.data.len()
+        self.data.len() + self.out_of_bounds_data.len()
     }
 
     pub fn remove_unfinished(&mut self) {
@@ -311,30 +349,7 @@ impl Learner1D {
     // ----------------------------------------------------------------
 
     fn update_scale(&mut self, y: &YValue) {
-        match y {
-            YValue::Scalar(v) => {
-                if self.y_min.is_empty() {
-                    self.y_min = vec![*v];
-                    self.y_max = vec![*v];
-                } else {
-                    self.y_min[0] = self.y_min[0].min(*v);
-                    self.y_max[0] = self.y_max[0].max(*v);
-                }
-            }
-            YValue::Vector(v) => {
-                if self.y_min.is_empty() {
-                    self.y_min = v.clone();
-                    self.y_max = v.clone();
-                } else {
-                    for (i, val) in v.iter().enumerate() {
-                        if i < self.y_min.len() {
-                            self.y_min[i] = self.y_min[i].min(*val);
-                            self.y_max[i] = self.y_max[i].max(*val);
-                        }
-                    }
-                }
-            }
-        }
+        update_y_bounds(&mut self.y_min, &mut self.y_max, y);
         self.y_scale = self
             .y_min
             .iter()
@@ -346,20 +361,17 @@ impl Learner1D {
     fn rebuild_scale(&mut self) {
         self.y_min.clear();
         self.y_max.clear();
-        let values: Vec<YValue> = self.data.values().cloned().collect();
-        for y in &values {
-            self.update_scale(y);
+        for y in self.data.values() {
+            update_y_bounds(&mut self.y_min, &mut self.y_max, y);
         }
-        // x_scale from combined points
-        if let (Some(&first), Some(&last)) = (
-            self.combined_points.iter().next(),
-            self.combined_points.iter().next_back(),
-        ) {
-            self.x_scale = (last - first).into_inner();
-        }
-        if self.x_scale == 0.0 {
-            self.x_scale = self.bounds.1 - self.bounds.0;
-        }
+        self.y_scale = self
+            .y_min
+            .iter()
+            .zip(self.y_max.iter())
+            .map(|(lo, hi)| hi - lo)
+            .fold(0.0_f64, f64::max);
+        // x_scale is always the domain width (matches Python where x_scale = bounds[1] - bounds[0])
+        self.x_scale = self.bounds.1 - self.bounds.0;
         self.old_y_scale = self.y_scale;
     }
 
@@ -590,7 +602,7 @@ impl Learner1D {
     // ----------------------------------------------------------------
 
     fn has_missing_bounds(&self) -> bool {
-        self.get_missing_bounds_list().iter().any(|_| true)
+        self.missing_bounds.iter().any(|b| !self.data.contains_key(b) && !self.pending.contains(b))
     }
 
     fn get_missing_bounds_list(&self) -> Vec<f64> {
@@ -621,11 +633,10 @@ impl Learner1D {
 
         if self.data.is_empty() && self.pending.is_empty() {
             let (a, b) = self.bounds;
-            let step = (b - a) / (n.max(1) as f64);
             let pts: Vec<f64> = if n == 1 {
                 vec![a]
             } else {
-                (0..n).map(|i| a + step * i as f64).collect()
+                (0..n).map(|i| a + (b - a) * i as f64 / (n - 1) as f64).collect()
             };
             return (pts, vec![f64::INFINITY; n]);
         }
@@ -730,7 +741,12 @@ impl Learner1D {
                 (Some((il, ir, loss_c)), Some((qk, _qq))) => {
                     let fl_c = finite_loss_value(*loss_c, *il, *ir, x_scale);
                     let fl_q = -qk.neg_fl.into_inner();
-                    fl_c >= fl_q
+                    // Python compares (loss, interval) tuples lexicographically
+                    if fl_c != fl_q {
+                        fl_c >= fl_q
+                    } else {
+                        (*il, *ir) >= (qk.left.into_inner(), qk.right.into_inner())
+                    }
                 }
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
