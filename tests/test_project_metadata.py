@@ -48,6 +48,8 @@ def test_ci_uses_uv_sync_and_runs_pre_commit() -> None:
     assert "uv sync --locked --only-group test" in workflow
     assert "uv run pytest -x -v" in workflow
     assert "uv run pre-commit run --all-files" in workflow
+    assert "cargo test --lib --tests" in workflow
+    assert "cargo test --all-targets" not in workflow
 
 
 def test_pyproject_declares_uv_dependency_groups() -> None:
