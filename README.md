@@ -1,5 +1,7 @@
 # adaptive-triangulation
 
+[![PyPI version](https://img.shields.io/pypi/v/adaptive-triangulation.svg)](https://pypi.org/project/adaptive-triangulation/)
+[![Python versions](https://img.shields.io/pypi/pyversions/adaptive-triangulation.svg)](https://pypi.org/project/adaptive-triangulation/)
 [![CI](https://github.com/python-adaptive/adaptive-triangulation/actions/workflows/ci.yml/badge.svg)](https://github.com/python-adaptive/adaptive-triangulation/actions)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
