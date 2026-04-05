@@ -7,7 +7,7 @@ use pyo3::exceptions::{
     PyValueError, PyZeroDivisionError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyList, PyModule, PySet, PyTuple};
+use pyo3::types::{PyAny, PyDict, PyList, PyModule, PySet, PyTuple};
 use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
 
@@ -764,21 +764,58 @@ impl Triangulation {
         Ok(result)
     }
 
+    fn simplex_points(
+        &self,
+        simplex: &[usize],
+        transform: Option<&[Vec<f64>]>,
+    ) -> Result<Vec<Vec<f64>>, TriangulationError> {
+        let vertices = self.get_vertices(simplex)?;
+        Ok(match transform {
+            Some(matrix) => vertices
+                .into_iter()
+                .map(|vertex| apply_transform(&vertex, matrix))
+                .collect(),
+            None => vertices,
+        })
+    }
+
+    fn circumscribed_circle_impl(
+        &self,
+        simplex: &[usize],
+        transform: Option<&[Vec<f64>]>,
+    ) -> Result<(Vec<f64>, f64), TriangulationError> {
+        let points = self.simplex_points(simplex, transform)?;
+        Ok(geometry::circumsphere(&points)?)
+    }
+
     pub fn circumscribed_circle(
         &self,
         simplex: &[usize],
         transform: &Option<Vec<Vec<f64>>>,
     ) -> Result<(Vec<f64>, f64), TriangulationError> {
         validate_transform(transform, self.dim)?;
-        let vertices = self.get_vertices(simplex)?;
-        let points = match transform.as_deref() {
-            Some(matrix) => vertices
-                .iter()
-                .map(|vertex| apply_transform(vertex, matrix))
-                .collect(),
-            None => vertices,
+        self.circumscribed_circle_impl(simplex, transform.as_deref())
+    }
+
+    fn point_in_circumcircle_impl(
+        &self,
+        point: &[f64],
+        simplex: &[usize],
+        transform: Option<&[Vec<f64>]>,
+    ) -> Result<bool, TriangulationError> {
+        let (center, radius) = self.circumscribed_circle_impl(simplex, transform)?;
+        let transformed_point = match transform {
+            Some(matrix) => apply_transform(point, matrix),
+            None => point.to_vec(),
         };
-        Ok(geometry::circumsphere(&points)?)
+        let distance = geometry::fast_norm(
+            &center
+                .iter()
+                .zip(&transformed_point)
+                .map(|(a, b)| a - b)
+                .collect::<Vec<_>>(),
+        );
+        Ok(distance < radius * (1.0 + DEFAULT_EPS))
     }
 
     pub fn point_in_circumcircle(
@@ -789,19 +826,7 @@ impl Triangulation {
     ) -> Result<bool, TriangulationError> {
         validate_transform(transform, self.dim)?;
         self.validate_vertex_index(pt_index)?;
-        let (center, radius) = self.circumscribed_circle(simplex, transform)?;
-        let point = match transform.as_deref() {
-            Some(matrix) => apply_transform(&self.vertices[pt_index], matrix),
-            None => self.vertices[pt_index].clone(),
-        };
-        let distance = geometry::fast_norm(
-            &center
-                .iter()
-                .zip(&point)
-                .map(|(a, b)| a - b)
-                .collect::<Vec<_>>(),
-        );
-        Ok(distance < radius * (1.0 + DEFAULT_EPS))
+        self.point_in_circumcircle_impl(&self.vertices[pt_index], simplex, transform.as_deref())
     }
 
     pub fn bowyer_watson(
@@ -1037,6 +1062,21 @@ impl Triangulation {
         Ok(geometry::volume(&self.get_vertices(simplex)?)?)
     }
 
+    pub fn has_simplex(&self, simplex: &[usize]) -> Result<bool, TriangulationError> {
+        let mut simplex = simplex.to_vec();
+        simplex.sort_unstable();
+        self.validate_simplex_indices(&simplex)?;
+        Ok(self.simplices.contains(&simplex))
+    }
+
+    pub fn vertex_to_simplices_for(
+        &self,
+        vertex: usize,
+    ) -> Result<&FxHashSet<Simplex>, TriangulationError> {
+        self.validate_vertex_index(vertex)?;
+        Ok(&self.vertex_to_simplices[vertex])
+    }
+
     pub fn volumes(&self) -> Result<Vec<f64>, TriangulationError> {
         self.simplices
             .iter()
@@ -1093,9 +1133,65 @@ pub struct PyTriangulation {
     pub core: Triangulation,
 }
 
+#[pyclass(name = "SimplicesProxy")]
+pub struct PySimplicesProxy {
+    triangulation: Py<PyTriangulation>,
+    vertex: Option<usize>,
+}
+
+impl PySimplicesProxy {
+    fn all(triangulation: Py<PyTriangulation>) -> Self {
+        Self {
+            triangulation,
+            vertex: None,
+        }
+    }
+
+    fn for_vertex(triangulation: Py<PyTriangulation>, vertex: usize) -> Self {
+        Self {
+            triangulation,
+            vertex: Some(vertex),
+        }
+    }
+}
+
+#[pyclass(name = "VerticesProxy")]
+pub struct PyVerticesProxy {
+    triangulation: Py<PyTriangulation>,
+}
+
+impl PyVerticesProxy {
+    fn new(triangulation: Py<PyTriangulation>) -> Self {
+        Self { triangulation }
+    }
+}
+
+#[pyclass(name = "VertexToSimplicesProxy")]
+pub struct PyVertexToSimplicesProxy {
+    triangulation: Py<PyTriangulation>,
+}
+
+impl PyVertexToSimplicesProxy {
+    fn new(triangulation: Py<PyTriangulation>) -> Self {
+        Self { triangulation }
+    }
+}
+
 #[pyclass]
 pub struct PyFacesIter {
     items: Vec<Simplex>,
+    index: usize,
+}
+
+#[pyclass]
+pub struct PyVerticesIter {
+    triangulation: Py<PyTriangulation>,
+    index: usize,
+}
+
+#[pyclass]
+pub struct PyVertexToSimplicesIter {
+    triangulation: Py<PyTriangulation>,
     index: usize,
 }
 
@@ -1109,6 +1205,142 @@ impl PyFacesIter {
         let item = self.items.get(self.index)?;
         self.index += 1;
         Some(simplex_tuple(py, item))
+    }
+}
+
+#[pymethods]
+impl PySimplicesProxy {
+    fn __contains__(&self, py: Python<'_>, simplex: &Bound<'_, PyTuple>) -> bool {
+        let triangulation = self.triangulation.bind(py).borrow();
+        let Ok(simplex) =
+            canonical_simplex_from_py(simplex.as_any(), triangulation.core.vertices.len())
+        else {
+            return false;
+        };
+
+        match self.vertex {
+            Some(vertex) => triangulation.core.vertex_to_simplices[vertex].contains(&simplex),
+            None => triangulation.core.simplices.contains(&simplex),
+        }
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> PyFacesIter {
+        let triangulation = self.triangulation.bind(py).borrow();
+        let items = match self.vertex {
+            Some(vertex) => triangulation.core.vertex_to_simplices[vertex]
+                .iter()
+                .cloned()
+                .collect(),
+            None => triangulation.core.simplices.iter().cloned().collect(),
+        };
+        PyFacesIter { items, index: 0 }
+    }
+
+    fn __len__(&self, py: Python<'_>) -> usize {
+        let triangulation = self.triangulation.bind(py).borrow();
+        match self.vertex {
+            Some(vertex) => triangulation.core.vertex_to_simplices[vertex].len(),
+            None => triangulation.core.simplices.len(),
+        }
+    }
+}
+
+#[pymethods]
+impl PyVerticesIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> Option<Py<PyTuple>> {
+        let triangulation = self.triangulation.bind(py).borrow();
+        let vertex = triangulation.core.vertices.get(self.index)?;
+        self.index += 1;
+        Some(point_tuple(py, vertex))
+    }
+}
+
+#[pymethods]
+impl PyVertexToSimplicesIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> Option<Py<PyAny>> {
+        let triangulation = self.triangulation.bind(py).borrow();
+        if self.index >= triangulation.core.vertices.len() {
+            return None;
+        }
+        let simplices =
+            simplex_set_py(py, &triangulation.core.vertex_to_simplices[self.index]).ok()?;
+        self.index += 1;
+        Some(simplices)
+    }
+}
+
+#[pymethods]
+impl PyVerticesProxy {
+    fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Py<PyTuple>> {
+        let triangulation = self.triangulation.bind(py).borrow();
+        let index = normalize_index(index, triangulation.core.vertices.len())
+            .map_err(TriangulationError::into_pyerr)?;
+        Ok(point_tuple(py, &triangulation.core.vertices[index]))
+    }
+
+    fn __len__(&self, py: Python<'_>) -> usize {
+        self.triangulation.bind(py).borrow().core.vertices.len()
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> PyVerticesIter {
+        PyVerticesIter {
+            triangulation: self.triangulation.clone_ref(py),
+            index: 0,
+        }
+    }
+
+    #[pyo3(signature = (dtype=None, copy=None))]
+    fn __array__(
+        &self,
+        py: Python<'_>,
+        dtype: Option<&Bound<'_, PyAny>>,
+        copy: Option<bool>,
+    ) -> PyResult<Py<PyAny>> {
+        let triangulation = self.triangulation.bind(py).borrow();
+        let vertices = point_list_py(py, &triangulation.core.vertices)?;
+        let numpy = PyModule::import(py, "numpy")?;
+        let kwargs = PyDict::new(py);
+        if let Some(dtype) = dtype {
+            kwargs.set_item("dtype", dtype)?;
+        }
+        let array = if copy == Some(false) {
+            numpy.call_method("asarray", (vertices,), Some(&kwargs))?
+        } else {
+            if let Some(copy) = copy {
+                kwargs.set_item("copy", copy)?;
+            }
+            numpy.call_method("array", (vertices,), Some(&kwargs))?
+        };
+        Ok(array.into())
+    }
+}
+
+#[pymethods]
+impl PyVertexToSimplicesProxy {
+    fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Py<PyAny>> {
+        let triangulation = self.triangulation.bind(py).borrow();
+        let index = normalize_index(index, triangulation.core.vertices.len())
+            .map_err(TriangulationError::into_pyerr)?;
+        simplex_set_py(py, &triangulation.core.vertex_to_simplices[index])
+    }
+
+    fn __len__(&self, py: Python<'_>) -> usize {
+        self.triangulation.bind(py).borrow().core.vertices.len()
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> PyVertexToSimplicesIter {
+        PyVertexToSimplicesIter {
+            triangulation: self.triangulation.clone_ref(py),
+            index: 0,
+        }
     }
 }
 
@@ -1186,24 +1418,39 @@ impl PyTriangulation {
     }
 
     #[getter(vertices)]
-    fn vertices_property(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        point_list_py(py, &self.core.vertices)
+    fn vertices_property(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyVerticesProxy>> {
+        Py::new(py, PyVerticesProxy::new(slf.into()))
     }
 
     #[getter(simplices)]
-    fn simplices_property(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        simplex_set_py(py, &self.core.simplices)
+    fn simplices_property(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PySimplicesProxy>> {
+        Py::new(py, PySimplicesProxy::all(slf.into()))
     }
 
     #[getter(vertex_to_simplices)]
-    fn vertex_to_simplices_property(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let sets: Vec<Py<PyAny>> = self
-            .core
-            .vertex_to_simplices
-            .iter()
-            .map(|simplices| simplex_set_py(py, simplices))
-            .collect::<PyResult<_>>()?;
-        Ok(PyList::new(py, sets)?.into())
+    fn vertex_to_simplices_property(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+    ) -> PyResult<Py<PyVertexToSimplicesProxy>> {
+        Py::new(py, PyVertexToSimplicesProxy::new(slf.into()))
+    }
+
+    fn has_simplex(&self, simplex: &Bound<'_, PyTuple>) -> bool {
+        let Ok(simplex) = canonical_simplex_from_py(simplex.as_any(), self.core.vertices.len())
+        else {
+            return false;
+        };
+        self.core.simplices.contains(&simplex)
+    }
+
+    fn vertex_to_simplices_for(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        vertex: isize,
+    ) -> PyResult<Py<PySimplicesProxy>> {
+        let vertex = normalize_index(vertex, slf.core.vertices.len())
+            .map_err(TriangulationError::into_pyerr)?;
+        Py::new(py, PySimplicesProxy::for_vertex(slf.into(), vertex))
     }
 
     #[getter(hull)]
@@ -1451,5 +1698,42 @@ impl PyTriangulation {
 
     fn convex_invariant(&self, _vertex: usize) -> PyResult<bool> {
         Err(PyNotImplementedError::new_err("convex_invariant"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_triangulation() -> Triangulation {
+        Triangulation::from_simplices(
+            vec![
+                vec![0.0, 0.0],
+                vec![1.0, 0.0],
+                vec![0.0, 1.0],
+                vec![1.0, 1.0],
+            ],
+            vec![vec![0, 1, 3], vec![0, 2, 3]],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn has_simplex_matches_current_membership() {
+        let tri = sample_triangulation();
+
+        assert!(tri.has_simplex(&[0, 1, 3]).unwrap());
+        assert!(tri.has_simplex(&[3, 1, 0]).unwrap());
+        assert!(!tri.has_simplex(&[0, 1, 2]).unwrap());
+    }
+
+    #[test]
+    fn vertex_to_simplices_for_returns_single_vertex_view() {
+        let tri = sample_triangulation();
+        let simplices = tri.vertex_to_simplices_for(0).unwrap();
+
+        assert_eq!(simplices.len(), 2);
+        assert!(simplices.contains(&vec![0, 1, 3]));
+        assert!(simplices.contains(&vec![0, 2, 3]));
     }
 }

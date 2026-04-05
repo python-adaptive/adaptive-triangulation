@@ -23,7 +23,11 @@ Usage::
 from __future__ import annotations
 
 from ._rust import (
+    SimplicesProxy,
     Triangulation,
+    VertexToSimplicesProxy,
+    VerticesProxy,
+    __version__,
     circumsphere,
     fast_2d_circumcircle,
     fast_2d_point_in_simplex,
@@ -35,12 +39,12 @@ from ._rust import (
     simplex_volume_in_embedding,
     volume,
 )
-from ._rust import (
-    __version__ as __version__,
-)
 
 __all__: list[str] = [
+    "SimplicesProxy",
     "Triangulation",
+    "VertexToSimplicesProxy",
+    "VerticesProxy",
     "__version__",
     "circumsphere",
     "fast_2d_circumcircle",

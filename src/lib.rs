@@ -7,7 +7,8 @@ use pyo3::types::{PyAny, PyModule, PyTuple};
 
 use crate::geometry as geom;
 use crate::triangulation::{
-    parse_point, parse_points_sized, point_tuple, PyFacesIter, PyTriangulation,
+    parse_point, parse_points_sized, point_tuple, PyFacesIter, PySimplicesProxy, PyTriangulation,
+    PyVertexToSimplicesIter, PyVertexToSimplicesProxy, PyVerticesIter, PyVerticesProxy,
 };
 
 fn numpy_linalg_error(py: Python<'_>, message: &str) -> PyErr {
@@ -33,6 +34,11 @@ fn point_in_simplex_error(py: Python<'_>, err: geom::GeometryError) -> PyErr {
 fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTriangulation>()?;
     m.add_class::<PyFacesIter>()?;
+    m.add_class::<PySimplicesProxy>()?;
+    m.add_class::<PyVerticesProxy>()?;
+    m.add_class::<PyVertexToSimplicesProxy>()?;
+    m.add_class::<PyVerticesIter>()?;
+    m.add_class::<PyVertexToSimplicesIter>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
     m.add_function(wrap_pyfunction!(py_circumsphere, m)?)?;

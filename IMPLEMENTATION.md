@@ -177,59 +177,59 @@ Wraps `Triangulation`. All methods exposed to Python.
 ```python
 class Triangulation:
     def __init__(self, coords: np.ndarray) -> None: ...
-    
+
     def add_point(
         self,
         point: tuple[float, ...] | np.ndarray,
         simplex: tuple[int, ...] | None = None,
         transform: np.ndarray | None = None,
     ) -> tuple[set[tuple[int, ...]], set[tuple[int, ...]]]: ...
-    
+
     @property
     def vertices(self) -> list[tuple[float, ...]]: ...
-    
+
     @property
     def simplices(self) -> set[tuple[int, ...]]: ...
-    
+
     @property
     def vertex_to_simplices(self) -> list[set[tuple[int, ...]]]: ...
-    
+
     @property
     def hull(self) -> set[int]: ...
-    
+
     @property
     def dim(self) -> int: ...
-    
+
     def get_vertices(self, indices: tuple[int, ...]) -> list[tuple[float, ...]]: ...
-    
+
     def locate_point(self, point: tuple[float, ...] | np.ndarray) -> tuple[int, ...] | None: ...
-    
+
     def get_reduced_simplex(
         self, point: tuple[float, ...], simplex: tuple[int, ...], eps: float = 1e-8
     ) -> tuple[int, ...]: ...
-    
+
     def circumscribed_circle(
         self, simplex: tuple[int, ...], transform: np.ndarray | None = None
     ) -> tuple[tuple[float, ...], float]: ...
-    
+
     def point_in_circumcircle(
         self, pt_index: int, simplex: tuple[int, ...], transform: np.ndarray | None = None
     ) -> bool: ...
-    
+
     def volume(self, simplex: tuple[int, ...]) -> float: ...
-    
+
     def faces(
         self, dim: int | None = None, vertices: bool = False,
         simplices: set[tuple[int, ...]] | None = None,
     ) -> Iterator: ...
-    
+
     def containing(self, face: tuple[int, ...]) -> set[tuple[int, ...]]: ...
-    
+
     def reference_invariant(self) -> bool: ...
-    
+
     @property
     def default_transform(self) -> np.ndarray: ...
-    
+
     def point_in_simplex(self, point: tuple[float, ...], simplex: tuple[int, ...], eps: float = 1e-8) -> bool: ...
 ```
 

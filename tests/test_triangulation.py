@@ -5,13 +5,11 @@ import math
 from collections import Counter
 from pathlib import Path
 
+import adaptive_triangulation as rust_tri
 import numpy as np
 import pytest
 
-import adaptive_triangulation as rust_tri
-
-
-REFERENCE_PATH = Path("/tmp/python_triangulation_reference.py")
+REFERENCE_PATH = Path("/tmp/python_triangulation_reference.py")  # noqa: S108
 
 
 def load_reference_module():
@@ -64,9 +62,9 @@ def assert_triangulation_equal(rust, reference) -> None:
 
 
 def assert_same_exception_type_name(rust_callable, reference_callable) -> None:
-    with pytest.raises(Exception) as rust_exc:
+    with pytest.raises(Exception) as rust_exc:  # noqa: PT011
         rust_callable()
-    with pytest.raises(Exception) as ref_exc:
+    with pytest.raises(Exception) as ref_exc:  # noqa: PT011
         reference_callable()
     assert type(rust_exc.value).__name__ == type(ref_exc.value).__name__
 
@@ -136,9 +134,7 @@ def test_construction_matches_reference(coords, probe):
 
 def test_geometry_functions_match_reference():
     triangle = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
-    tetra = np.array(
-        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-    )
+    tetra = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
     simplex4 = np.array(
         [
             [0.0, 0.0, 0.0, 0.0],
@@ -268,9 +264,9 @@ def test_circumscribed_circle_and_point_in_circumcircle_match_reference():
     assert radius == pytest.approx(ref_radius)
 
     for idx in range(len(coords)):
-        assert rust.point_in_circumcircle(idx, simplex, transform=transform) == reference.point_in_cicumcircle(
-            idx, simplex, transform
-        )
+        assert rust.point_in_circumcircle(
+            idx, simplex, transform=transform
+        ) == reference.point_in_cicumcircle(idx, simplex, transform)
 
 
 def test_default_transform_and_point_in_simplex_instance_method():
@@ -351,6 +347,83 @@ def test_get_vertices_preserves_order_and_negative_indices():
 
     assert_points_close(rust.get_vertices((2, 0, 1)), reference.get_vertices((2, 0, 1)))
     assert_points_close(rust.get_vertices((-1, 0, 1)), reference.get_vertices((-1, 0, 1)))
+
+
+def test_vertices_proxy_supports_index_len_and_iteration():
+    coords = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+    tri = rust_tri.Triangulation(coords)
+    proxy = tri.vertices
+
+    assert type(proxy).__name__ == "VerticesProxy"
+    assert len(proxy) == len(coords)
+    assert_points_close(proxy[0], coords[0])
+    assert_points_close(proxy[-1], coords[-1])
+    assert_points_close(list(proxy), coords)
+
+
+def test_has_simplex_and_simplices_proxy_membership():
+    tri = rust_tri.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    simplex = next(iter(tri.simplices))
+
+    assert tri.has_simplex(simplex) is True
+    assert tri.has_simplex(tuple(reversed(simplex))) is True
+    assert tri.has_simplex((0, 1, 2)) is False
+
+    assert simplex in tri.simplices
+    assert tuple(reversed(simplex)) in tri.simplices
+    assert (0, 1, 2) not in tri.simplices
+
+
+def test_simplices_proxy_iteration_and_len_match_materialized_set():
+    tri = rust_tri.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    proxy = tri.simplices
+    expected = {tuple(simplex) for simplex in proxy}
+
+    assert type(proxy).__name__ == "SimplicesProxy"
+    assert len(proxy) == len(expected)
+    assert {tuple(simplex) for simplex in proxy} == expected
+
+
+def test_vertex_to_simplices_for_matches_materialized_property():
+    tri = rust_tri.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+
+    for vertex in range(len(tri.vertices)):
+        proxy = tri.vertex_to_simplices_for(vertex)
+        expected = as_simplex_set(tri.vertex_to_simplices[vertex])
+
+        assert type(proxy).__name__ == "SimplicesProxy"
+        assert len(proxy) == len(expected)
+        assert as_simplex_set(proxy) == expected
+
+    assert as_simplex_set(tri.vertex_to_simplices_for(-1)) == as_simplex_set(
+        tri.vertex_to_simplices[-1]
+    )
+
+
+def test_vertex_to_simplices_proxy_supports_index_len_and_iteration():
+    tri = rust_tri.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    proxy = tri.vertex_to_simplices
+
+    assert type(proxy).__name__ == "VertexToSimplicesProxy"
+    assert len(proxy) == len(tri.vertices)
+
+    for index in range(len(proxy)):
+        assert isinstance(proxy[index], set)
+        assert as_simplex_set(proxy[index]) == as_simplex_set(tri.vertex_to_simplices_for(index))
+
+    assert isinstance(proxy[-1], set)
+    assert as_simplex_set(proxy[-1]) == as_simplex_set(tri.vertex_to_simplices_for(-1))
+
+    iterated = [as_simplex_set(simplices) for simplices in proxy]
+    expected = [as_simplex_set(tri.vertex_to_simplices_for(index)) for index in range(len(proxy))]
+    assert iterated == expected
+
+    simplex = next(iter(tri.simplices))
+    unioned = set.union(*[proxy[index] for index in simplex])
+    expected_union = set.union(
+        *[as_simplex_set(tri.vertex_to_simplices_for(index)) for index in simplex]
+    )
+    assert as_simplex_set(unioned) == expected_union
 
 
 def test_get_reduced_simplex_preserves_order_and_returns_list():
@@ -454,7 +527,9 @@ def test_tiny_triangle_point_in_simplex_matches_reference():
     triangle = np.array([[0.0, 0.0], [1e-18, 0.0], [0.0, 1e-18]])
     point = np.array([2e-19, 2e-19])
 
-    assert rust_tri.fast_2d_point_in_simplex(point, triangle) == REF.fast_2d_point_in_simplex(point, triangle)
+    assert rust_tri.fast_2d_point_in_simplex(point, triangle) == REF.fast_2d_point_in_simplex(
+        point, triangle
+    )
     assert rust_tri.point_in_simplex(point, triangle) == REF.point_in_simplex(point, triangle)
 
     tri = rust_tri.Triangulation(triangle)
@@ -467,9 +542,9 @@ def test_simplex_volume_in_embedding_matches_reference_edge_case():
         lambda: rust_tri.simplex_volume_in_embedding([[0.0, 0.0], [1.0, 0.0]]),
         lambda: REF.simplex_volume_in_embedding([[0.0, 0.0], [1.0, 0.0]]),
     )
-    assert rust_tri.simplex_volume_in_embedding([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]) == pytest.approx(
-        REF.simplex_volume_in_embedding([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
-    )
+    assert rust_tri.simplex_volume_in_embedding(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+    ) == pytest.approx(REF.simplex_volume_in_embedding([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]))
 
 
 def test_orientation_matches_reference_at_large_scale():
@@ -515,7 +590,11 @@ def test_degenerate_4d_circumsphere_returns_nan_like_reference():
     assert np.isnan(radius)
     assert np.isnan(ref_radius)
     assert np.array(center, dtype=float).shape == np.array(ref_center, dtype=float).shape
-    assert np.all(np.isnan(np.array(center, dtype=float)) | np.isinf(np.array(ref_center, dtype=float)) | np.isnan(np.array(ref_center, dtype=float)))
+    assert np.all(
+        np.isnan(np.array(center, dtype=float))
+        | np.isinf(np.array(ref_center, dtype=float))
+        | np.isnan(np.array(ref_center, dtype=float))
+    )
 
 
 def test_constructor_accepts_sized_custom_sequences():
@@ -537,7 +616,9 @@ def test_transform_requires_sized_2d_input():
     transform = ((x for x in row) for row in ((1.0, 0.0), (0.0, 1.0)))
     assert_same_exception_type_name(
         lambda: tri.circumscribed_circle((0, 1, 2), transform=transform),
-        lambda: reference.circumscribed_circle((0, 1, 2), ((x for x in row) for row in ((1.0, 0.0), (0.0, 1.0)))),
+        lambda: reference.circumscribed_circle(
+            (0, 1, 2), ((x for x in row) for row in ((1.0, 0.0), (0.0, 1.0)))
+        ),
     )
 
 

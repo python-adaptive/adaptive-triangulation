@@ -1,5 +1,14 @@
 from ._rust import (
+    SimplicesProxy as SimplicesProxy,
+)
+from ._rust import (
     Triangulation as Triangulation,
+)
+from ._rust import (
+    VertexToSimplicesProxy as VertexToSimplicesProxy,
+)
+from ._rust import (
+    VerticesProxy as VerticesProxy,
 )
 from ._rust import (
     __version__ as __version__,
@@ -36,7 +45,10 @@ from ._rust import (
 )
 
 __all__: list[str] = [
+    "SimplicesProxy",
     "Triangulation",
+    "VertexToSimplicesProxy",
+    "VerticesProxy",
     "__version__",
     "circumsphere",
     "fast_2d_circumcircle",
