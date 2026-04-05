@@ -23,8 +23,19 @@ def workflow_python_versions() -> list[str]:
     return sorted(set(re.findall(r'- "(3\.\d+)"', workflow)))
 
 
+def workflow_contents() -> str:
+    return (ROOT / ".github/workflows/ci.yml").read_text()
+
+
 def test_python_version_support_matches_current_bindings() -> None:
     expected = ["3.10", "3.11", "3.12", "3.13"]
 
     assert pyproject_python_versions() == expected
     assert workflow_python_versions() == expected
+
+
+def test_ci_avoids_maturin_develop_without_virtualenv() -> None:
+    workflow = workflow_contents()
+
+    assert "maturin develop" not in workflow
+    assert "python -m pip install ." in workflow

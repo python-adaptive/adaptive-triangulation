@@ -43,10 +43,10 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install maturin pytest scipy
+          python -m pip install pytest scipy
 
-      - name: Build extension in editable mode
-        run: maturin develop
+      - name: Install package
+        run: python -m pip install .
 
       - name: Run test suite
         run: pytest -x -v
