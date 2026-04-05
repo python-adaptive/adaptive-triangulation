@@ -9,7 +9,7 @@ import adaptive_triangulation as rust_tri
 import numpy as np
 import pytest
 
-REFERENCE_PATH = Path("/tmp/python_triangulation_reference.py")  # noqa: S108
+REFERENCE_PATH = Path(__file__).with_name("python_triangulation_reference.py")
 
 
 def load_reference_module():

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import tomllib
 from pathlib import Path
 
 
@@ -9,12 +8,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def pyproject_python_versions() -> list[str]:
-    data = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    classifiers = data["project"]["classifiers"]
+    pyproject = (ROOT / "pyproject.toml").read_text()
     return sorted(
-        match.group(1)
-        for classifier in classifiers
-        if (match := re.fullmatch(r"Programming Language :: Python :: (3\.\d+)", classifier))
+        set(
+            re.findall(
+                r'^\s*"Programming Language :: Python :: (3\.\d+)",$',
+                pyproject,
+                re.MULTILINE,
+            )
+        )
     )
 
 
@@ -39,3 +41,10 @@ def test_ci_avoids_maturin_develop_without_virtualenv() -> None:
 
     assert "maturin develop" not in workflow
     assert "python -m pip install ." in workflow
+
+
+def test_reference_module_is_vendored_in_repo() -> None:
+    triangulation_test = (ROOT / "tests/test_triangulation.py").read_text()
+
+    assert "/tmp/python_triangulation_reference.py" not in triangulation_test
+    assert (ROOT / "tests/python_triangulation_reference.py").exists()
