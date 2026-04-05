@@ -23,6 +23,7 @@ Usage::
 from __future__ import annotations
 
 from ._rust import (
+    Learner1D,
     SimplicesProxy,
     Triangulation,
     VertexToSimplicesProxy,
@@ -42,6 +43,7 @@ from ._rust import (
 )
 
 __all__: list[str] = [
+    "Learner1D",
     "SimplicesProxy",
     "Triangulation",
     "VertexToSimplicesProxy",
