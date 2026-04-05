@@ -5,20 +5,19 @@ simplex queries, and geometry computations.
 """
 
 import numpy as np
-
 from adaptive_triangulation import Triangulation, circumsphere, volume
 
 # Create a 2D triangulation from initial points
 points = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
 tri = Triangulation(points)
-
 print(f"Vertices: {len(tri.vertices)}")
 print(f"Simplices: {len(tri.simplices)}")
 print(f"Dimension: {tri.dim}")
 
+
 # Add a point incrementally (Bowyer-Watson insertion)
 deleted, added = tri.add_point((0.5, 0.5))
-print(f"\nAfter adding (0.5, 0.5):")
+print("\nAfter adding (0.5, 0.5):")
 print(f"  Deleted simplices: {len(deleted)}")
 print(f"  Added simplices: {len(added)}")
 print(f"  Total simplices: {len(tri.simplices)}")

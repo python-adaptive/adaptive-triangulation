@@ -1,26 +1,12 @@
 from __future__ import annotations
 
-import importlib.util
 import math
 from collections import Counter
-from pathlib import Path
 
 import adaptive_triangulation as rust_tri
 import numpy as np
 import pytest
-
-REFERENCE_PATH = Path(__file__).with_name("python_triangulation_reference.py")
-
-
-def load_reference_module():
-    spec = importlib.util.spec_from_file_location("python_triangulation_reference", REFERENCE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-REF = load_reference_module()
+from adaptive.learner import triangulation as reference_module
 
 
 def as_simplex_set(value) -> set[tuple[int, ...]]:
@@ -126,7 +112,7 @@ def assert_locate_equivalent(rust, reference, point) -> None:
 )
 def test_construction_matches_reference(coords, probe):
     rust = rust_tri.Triangulation(np.asarray(coords, dtype=float))
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
 
     assert_triangulation_equal(rust, reference)
     assert_locate_equivalent(rust, reference, probe)
@@ -146,27 +132,27 @@ def test_geometry_functions_match_reference():
     )
 
     center, radius = rust_tri.circumsphere(simplex4)
-    ref_center, ref_radius = REF.circumsphere(simplex4)
+    ref_center, ref_radius = reference_module.circumsphere(simplex4)
     assert_points_close(center, ref_center)
     assert radius == pytest.approx(ref_radius)
 
     fast_center, fast_radius = rust_tri.fast_2d_circumcircle(triangle)
-    ref_fast_center, ref_fast_radius = REF.fast_2d_circumcircle(triangle)
+    ref_fast_center, ref_fast_radius = reference_module.fast_2d_circumcircle(triangle)
     assert_points_close(fast_center, ref_fast_center)
     assert fast_radius == pytest.approx(ref_fast_radius)
 
     fast3_center, fast3_radius = rust_tri.fast_3d_circumsphere(tetra)
-    ref_fast3_center, ref_fast3_radius = REF.fast_3d_circumcircle(tetra)
+    ref_fast3_center, ref_fast3_radius = reference_module.fast_3d_circumcircle(tetra)
     assert_points_close(fast3_center, ref_fast3_center)
     assert fast3_radius == pytest.approx(ref_fast3_radius)
 
     assert rust_tri.fast_2d_point_in_simplex([0.2, 0.2], triangle) is True
     assert rust_tri.fast_2d_point_in_simplex([1.1, 0.2], triangle) is False
-    assert rust_tri.point_in_simplex([0.2, 0.2], triangle) == REF.point_in_simplex(
+    assert rust_tri.point_in_simplex([0.2, 0.2], triangle) == reference_module.point_in_simplex(
         np.array([0.2, 0.2]),
         triangle,
     )
-    assert rust_tri.point_in_simplex([0.2, 0.2, 0.2], tetra) == REF.point_in_simplex(
+    assert rust_tri.point_in_simplex([0.2, 0.2, 0.2], tetra) == reference_module.point_in_simplex(
         np.array([0.2, 0.2, 0.2]),
         tetra,
     )
@@ -177,7 +163,7 @@ def test_geometry_functions_match_reference():
     assert rust_tri.simplex_volume_in_embedding(embedded_triangle) == pytest.approx(6.0)
 
     orientation = rust_tri.orientation([[1.0, 0.0], [0.0, 1.0]], [0.1, 0.1])
-    ref_orientation = REF.orientation([[1.0, 0.0], [0.0, 1.0]], [0.1, 0.1])
+    ref_orientation = reference_module.orientation([[1.0, 0.0], [0.0, 1.0]], [0.1, 0.1])
     assert orientation == ref_orientation
     assert rust_tri.fast_norm([3.0, 4.0]) == pytest.approx(5.0)
     fast3_alias_center, fast3_alias_radius = rust_tri.fast_3d_circumcircle(tetra)
@@ -188,7 +174,7 @@ def test_geometry_functions_match_reference():
 def test_faces_containing_and_hull_match_reference():
     coords = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.4, 0.2]]
     rust = rust_tri.Triangulation(coords)
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
 
     assert face_counter(rust.faces()) == face_counter(reference.faces())
     assert face_counter(rust.faces(dim=1)) == face_counter(reference.faces(dim=1))
@@ -206,7 +192,7 @@ def test_add_point_inside_hull_matches_reference():
     coords = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
     point = [0.3, 0.4]
     rust = rust_tri.Triangulation(coords)
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
 
     rust_deleted, rust_added = rust.add_point(point)
     ref_deleted, ref_added = reference.add_point(point)
@@ -220,7 +206,7 @@ def test_add_point_outside_hull_matches_reference():
     coords = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.3, 0.3]]
     point = [1.5, 0.5]
     rust = rust_tri.Triangulation(coords)
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
 
     rust_deleted, rust_added = rust.add_point(point)
     ref_deleted, ref_added = reference.add_point(point)
@@ -236,7 +222,7 @@ def test_add_point_with_transform_matches_reference():
     transform = np.array([[2.0, 0.0], [0.0, 0.5]])
 
     rust = rust_tri.Triangulation(coords)
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
 
     rust_deleted, rust_added = rust.add_point(point, transform=transform)
     ref_deleted, ref_added = reference.add_point(point, transform=transform)
@@ -255,7 +241,7 @@ def test_circumscribed_circle_and_point_in_circumcircle_match_reference():
         ]
     )
     rust = rust_tri.Triangulation(coords)
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
 
     simplex = next(iter(as_simplex_set(rust.simplices)))
     center, radius = rust.circumscribed_circle(simplex, transform=transform)
@@ -292,7 +278,7 @@ def test_random_cross_validation_2d():
     rng = np.random.default_rng(1234)
     coords = rng.random((6, 2))
     rust = rust_tri.Triangulation(coords[:3])
-    reference = REF.Triangulation(coords[:3])
+    reference = reference_module.Triangulation(coords[:3])
 
     for point in coords[3:]:
         rust_deleted, rust_added = rust.add_point(point)
@@ -306,7 +292,7 @@ def test_random_cross_validation_3d():
     rng = np.random.default_rng(4321)
     coords = rng.random((7, 3))
     rust = rust_tri.Triangulation(coords[:4])
-    reference = REF.Triangulation(coords[:4])
+    reference = reference_module.Triangulation(coords[:4])
 
     for point in coords[4:]:
         rust_deleted, rust_added = rust.add_point(point)
@@ -319,7 +305,7 @@ def test_random_cross_validation_3d():
 def test_constructor_handles_degenerate_leading_points():
     coords = [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [0.0, 1.0]]
     rust = rust_tri.Triangulation(coords)
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
 
     assert_triangulation_equal(rust, reference)
 
@@ -327,7 +313,7 @@ def test_constructor_handles_degenerate_leading_points():
 def test_constructor_matches_reference_on_cocircular_input():
     coords = [[0.5, 0.0], [0.0, 0.5], [0.5, 1.0], [1.0, 0.5]]
     rust = rust_tri.Triangulation(coords)
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
 
     assert_triangulation_equal(rust, reference)
 
@@ -335,7 +321,7 @@ def test_constructor_matches_reference_on_cocircular_input():
 def test_constructor_accepts_duplicate_trailing_points():
     coords = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 0.0]]
     rust = rust_tri.Triangulation(coords)
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
 
     assert_triangulation_equal(rust, reference)
 
@@ -343,7 +329,7 @@ def test_constructor_accepts_duplicate_trailing_points():
 def test_get_vertices_preserves_order_and_negative_indices():
     coords = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
     rust = rust_tri.Triangulation(coords)
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
 
     assert_points_close(rust.get_vertices((2, 0, 1)), reference.get_vertices((2, 0, 1)))
     assert_points_close(rust.get_vertices((-1, 0, 1)), reference.get_vertices((-1, 0, 1)))
@@ -429,7 +415,7 @@ def test_vertex_to_simplices_proxy_supports_index_len_and_iteration():
 def test_get_reduced_simplex_preserves_order_and_returns_list():
     coords = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
     rust = rust_tri.Triangulation(coords)
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
 
     rust_result = rust.get_reduced_simplex((0.5, 0.0), (1, 0, 2))
     ref_result = reference.get_reduced_simplex(np.array((0.5, 0.0)), (1, 0, 2))
@@ -441,7 +427,7 @@ def test_get_reduced_simplex_preserves_order_and_returns_list():
 def test_get_reduced_simplex_preserves_negative_indices_in_output():
     coords = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
     rust = rust_tri.Triangulation(coords)
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
 
     rust_result = rust.get_reduced_simplex((0.5, 0.0), (-3, -2, -1))
     ref_result = reference.get_reduced_simplex(np.array((0.5, 0.0)), (-3, -2, -1))
@@ -451,7 +437,7 @@ def test_get_reduced_simplex_preserves_negative_indices_in_output():
 def test_invalid_indices_raise_reference_compatible_exceptions():
     coords = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
     rust = rust_tri.Triangulation(coords)
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
 
     assert_same_exception_type_name(
         lambda: rust.get_vertices((99,)),
@@ -486,7 +472,7 @@ def test_invalid_indices_raise_reference_compatible_exceptions():
 def test_dimension_mismatches_raise_value_error():
     coords = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
     rust = rust_tri.Triangulation(coords)
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
 
     assert_same_exception_type_name(
         lambda: rust.locate_point((0.1, 0.2, 0.3)),
@@ -505,18 +491,18 @@ def test_dimension_mismatches_raise_value_error():
 def test_module_point_in_simplex_matches_reference_errors_on_degenerate_inputs():
     assert_same_exception_type_name(
         lambda: rust_tri.fast_2d_point_in_simplex((0.5, 0.5), [(0, 0), (1, 1), (2, 2)]),
-        lambda: REF.fast_2d_point_in_simplex((0.5, 0.5), [(0, 0), (1, 1), (2, 2)]),
+        lambda: reference_module.fast_2d_point_in_simplex((0.5, 0.5), [(0, 0), (1, 1), (2, 2)]),
     )
     assert_same_exception_type_name(
         lambda: rust_tri.point_in_simplex((0.5, 0.5), [(0, 0), (1, 1), (2, 2)]),
-        lambda: REF.point_in_simplex((0.5, 0.5), [(0, 0), (1, 1), (2, 2)]),
+        lambda: reference_module.point_in_simplex((0.5, 0.5), [(0, 0), (1, 1), (2, 2)]),
     )
     assert_same_exception_type_name(
         lambda: rust_tri.point_in_simplex(
             np.array([0.1, 0.1, 0.0]),
             np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0], [0, 1, 0]]),
         ),
-        lambda: REF.point_in_simplex(
+        lambda: reference_module.point_in_simplex(
             np.array([0.1, 0.1, 0.0]),
             np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0], [0, 1, 0]]),
         ),
@@ -527,24 +513,28 @@ def test_tiny_triangle_point_in_simplex_matches_reference():
     triangle = np.array([[0.0, 0.0], [1e-18, 0.0], [0.0, 1e-18]])
     point = np.array([2e-19, 2e-19])
 
-    assert rust_tri.fast_2d_point_in_simplex(point, triangle) == REF.fast_2d_point_in_simplex(
+    assert rust_tri.fast_2d_point_in_simplex(
+        point, triangle
+    ) == reference_module.fast_2d_point_in_simplex(point, triangle)
+    assert rust_tri.point_in_simplex(point, triangle) == reference_module.point_in_simplex(
         point, triangle
     )
-    assert rust_tri.point_in_simplex(point, triangle) == REF.point_in_simplex(point, triangle)
 
     tri = rust_tri.Triangulation(triangle)
-    ref_tri = REF.Triangulation(triangle)
+    ref_tri = reference_module.Triangulation(triangle)
     assert tuple(tri.locate_point(point)) == tuple(ref_tri.locate_point(point))
 
 
 def test_simplex_volume_in_embedding_matches_reference_edge_case():
     assert_same_exception_type_name(
         lambda: rust_tri.simplex_volume_in_embedding([[0.0, 0.0], [1.0, 0.0]]),
-        lambda: REF.simplex_volume_in_embedding([[0.0, 0.0], [1.0, 0.0]]),
+        lambda: reference_module.simplex_volume_in_embedding([[0.0, 0.0], [1.0, 0.0]]),
     )
     assert rust_tri.simplex_volume_in_embedding(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
-    ) == pytest.approx(REF.simplex_volume_in_embedding([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]))
+    ) == pytest.approx(
+        reference_module.simplex_volume_in_embedding([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    )
 
 
 def test_orientation_matches_reference_at_large_scale():
@@ -554,7 +544,7 @@ def test_orientation_matches_reference_at_large_scale():
         [-2.601736071958286e-141, -6.554531137710295e188, -3.6204403844520214e154],
     ]
     origin = [0.0, 0.0, 0.0]
-    assert rust_tri.orientation(face, origin) == REF.orientation(face, origin)
+    assert rust_tri.orientation(face, origin) == reference_module.orientation(face, origin)
 
 
 def test_circumsphere_handles_tiny_4d_simplex():
@@ -569,7 +559,7 @@ def test_circumsphere_handles_tiny_4d_simplex():
     )
 
     center, radius = rust_tri.circumsphere(simplex)
-    ref_center, ref_radius = REF.circumsphere(simplex)
+    ref_center, ref_radius = reference_module.circumsphere(simplex)
     assert_points_close(center, ref_center, atol=1e-20)
     assert radius == pytest.approx(ref_radius)
 
@@ -586,7 +576,7 @@ def test_degenerate_4d_circumsphere_returns_nan_like_reference():
     )
 
     center, radius = rust_tri.circumsphere(simplex)
-    ref_center, ref_radius = REF.circumsphere(simplex)
+    ref_center, ref_radius = reference_module.circumsphere(simplex)
     assert np.isnan(radius)
     assert np.isnan(ref_radius)
     assert np.array(center, dtype=float).shape == np.array(ref_center, dtype=float).shape
@@ -600,7 +590,7 @@ def test_degenerate_4d_circumsphere_returns_nan_like_reference():
 def test_constructor_accepts_sized_custom_sequences():
     coords = Seq([Seq([0.0, 0.0]), Seq([1.0, 0.0]), Seq([0.0, 1.0]), Seq([1.0, 1.0])])
     rust = rust_tri.Triangulation(coords)
-    reference = REF.Triangulation(coords)
+    reference = reference_module.Triangulation(coords)
     assert_triangulation_equal(rust, reference)
 
 
@@ -611,7 +601,7 @@ def test_constructor_raises_value_error_for_linearly_dependent_input():
 
 def test_transform_requires_sized_2d_input():
     tri = rust_tri.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
-    reference = REF.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    reference = reference_module.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
 
     transform = ((x for x in row) for row in ((1.0, 0.0), (0.0, 1.0)))
     assert_same_exception_type_name(
@@ -626,7 +616,7 @@ def test_random_cross_validation_4d():
     rng = np.random.default_rng(2468)
     coords = rng.random((8, 4))
     rust = rust_tri.Triangulation(coords[:5])
-    reference = REF.Triangulation(coords[:5])
+    reference = reference_module.Triangulation(coords[:5])
 
     for point in coords[5:]:
         rust_deleted, rust_added = rust.add_point(point)

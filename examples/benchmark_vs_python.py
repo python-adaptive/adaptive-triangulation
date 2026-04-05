@@ -6,9 +6,8 @@ across different dimensions and point counts.
 
 import time
 
-import numpy as np
-
 import adaptive_triangulation as at
+import numpy as np
 
 # Try importing Python reference
 try:
@@ -68,6 +67,7 @@ configs = [
 
 print(f"{'Dim':>3} {'N':>6} {'Rust':>10} {'Python':>10} {'Speedup':>8}")
 print("-" * 45)
+
 
 for dim, sizes in configs:
     for n in sizes:

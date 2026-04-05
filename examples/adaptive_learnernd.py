@@ -9,9 +9,8 @@ Requirements:
 
 import time
 
-import numpy as np
-
 import adaptive_triangulation as at
+import numpy as np
 from adaptive.learner import learnerND as lnd_mod
 from adaptive.learner.learnerND import LearnerND
 

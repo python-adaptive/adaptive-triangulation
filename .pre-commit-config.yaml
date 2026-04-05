@@ -20,7 +20,7 @@ repos:
       - id: mypy
         additional_dependencies: [numpy]
         args: [--strict]
-        exclude: '(\.pyi$|tests/)'
+        exclude: '(\.pyi$|tests/|examples/)'
   - repo: local
     hooks:
       - id: cargo-fmt

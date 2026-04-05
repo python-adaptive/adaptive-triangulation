@@ -27,8 +27,19 @@ dependencies = [
     "numpy>=1.24",
 ]
 
-[project.optional-dependencies]
-test = ["pytest>=7.0", "scipy>=1.10"]
+[dependency-groups]
+dev = [
+    { include-group = "lint" },
+    { include-group = "test" },
+]
+lint = [
+    "pre-commit",
+]
+test = [
+    "adaptive",
+    "pytest>=7.0",
+    "scipy>=1.10",
+]
 
 [project.urls]
 Homepage = "https://github.com/python-adaptive/adaptive-triangulation"
@@ -51,6 +62,7 @@ ignore = ["D", "COM812", "ISC001"]
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "PLR2004", "ANN"]
 "benchmarks/*" = ["T201", "ANN", "S101"]
+"examples/*" = ["INP001", "T201", "S101", "N813", "RUF001", "RUF002", "SIM105", "PERF203"]
 
 [tool.mypy]
 strict = true
