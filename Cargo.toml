@@ -17,11 +17,12 @@ crate-type = ["cdylib", "rlib"]
 criterion = "0.5"
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
+pyo3 = { version = "0.23", features = ["abi3-py310"] }
 numpy = "0.23"
 nalgebra = "0.33"
 thiserror = "2"
 rustc-hash = "2"
+ordered-float = "4"
 
 [profile.release]
 lto = true

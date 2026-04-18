@@ -1,4 +1,5 @@
 pub mod geometry;
+pub mod learner1d;
 pub mod triangulation;
 
 use pyo3::exceptions::{PyValueError, PyZeroDivisionError};
@@ -39,6 +40,7 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVertexToSimplicesProxy>()?;
     m.add_class::<PyVerticesIter>()?;
     m.add_class::<PyVertexToSimplicesIter>()?;
+    m.add_class::<crate::learner1d::python::PyLearner1D>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
     m.add_function(wrap_pyfunction!(py_circumsphere, m)?)?;
