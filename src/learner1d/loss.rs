@@ -232,8 +232,8 @@ fn curvature_loss(
     horizontal_factor: f64,
 ) -> f64 {
     let tri_l = triangle_loss_fn(xs, ys);
-    let def_l = default_loss(&[xs[1], xs[2]], &[ys[1], ys[2]]);
-    let dx = xs[2].unwrap() - xs[1].unwrap();
+    let def_l = default_loss(&xs[1..3], &ys[1..3]);
+    let dx = uniform_loss(&xs[1..3]);
     area_factor * tri_l.sqrt() + euclid_factor * def_l + horizontal_factor * dx
 }
 
@@ -373,6 +373,13 @@ impl LossManager {
         }
     }
 
+    fn loss_for_entry(&self, entry: &LossEntry) -> f64 {
+        self.interval_to_loss[&Interval {
+            left: entry.left,
+            right: entry.right,
+        }]
+    }
+
     pub fn insert(&mut self, left: OF64, right: OF64, loss: f64) {
         let ival = Interval { left, right };
         if let Some(old_loss) = self.interval_to_loss.remove(&ival) {
@@ -398,39 +405,17 @@ impl LossManager {
             .copied()
     }
 
-    pub fn contains(&self, left: OF64, right: OF64) -> bool {
-        self.interval_to_loss
-            .contains_key(&Interval { left, right })
-    }
-
-    pub fn len(&self) -> usize {
-        self.interval_to_loss.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.interval_to_loss.is_empty()
-    }
-
     /// Raw loss of the highest-priority interval.
     pub fn peek_max_loss(&self) -> Option<f64> {
-        self.queue.iter().next().map(|entry| {
-            self.interval_to_loss[&Interval {
-                left: entry.left,
-                right: entry.right,
-            }]
-        })
+        self.queue.iter().next().map(|entry| self.loss_for_entry(entry))
     }
 
     /// Iterate entries in priority order (highest loss first).
     /// Yields `(left, right, raw_loss)`.
     pub fn iter_by_priority(&self) -> impl Iterator<Item = (OF64, OF64, f64)> + '_ {
-        self.queue.iter().map(move |entry| {
-            let loss = self.interval_to_loss[&Interval {
-                left: entry.left,
-                right: entry.right,
-            }];
-            (entry.left, entry.right, loss)
-        })
+        self.queue
+            .iter()
+            .map(move |entry| (entry.left, entry.right, self.loss_for_entry(entry)))
     }
 
     /// Collect all intervals (no particular order).
@@ -439,10 +424,5 @@ impl LossManager {
             .keys()
             .map(|iv| (iv.left, iv.right))
             .collect()
-    }
-
-    pub fn clear(&mut self) {
-        self.interval_to_loss.clear();
-        self.queue.clear();
     }
 }
