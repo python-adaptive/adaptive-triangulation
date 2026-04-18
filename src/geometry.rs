@@ -424,10 +424,12 @@ pub fn simplex_volume_in_embedding(vertices: &[Vec<f64>]) -> Result<f64, Geometr
         ));
     }
 
-    if vertices[0].len() == 2 && vertices.len() != 3 {
-        return Err(GeometryError::InvalidDimensions(
-            "Expected three 2D vertices".to_string(),
-        ));
+    if vertices.len() == 2 {
+        let length_sq = squared_distance(&vertices[0], &vertices[1]);
+        if length_sq == 0.0 {
+            return Err(GeometryError::DegenerateSimplex);
+        }
+        return Ok(length_sq.sqrt());
     }
 
     if vertices.len() == 3 {
@@ -464,4 +466,29 @@ pub fn simplex_volume_in_embedding(vertices: &[Vec<f64>]) -> Result<f64, Geometr
         return Err(GeometryError::DegenerateSimplex);
     }
     Ok(vol_square.sqrt())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simplex_volume_in_embedding_returns_segment_length() {
+        let length =
+            simplex_volume_in_embedding(&[vec![0.0, 0.0, 0.0], vec![3.0, 4.0, 0.0]]).unwrap();
+        assert!((length - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn simplex_volume_in_embedding_rejects_identical_endpoints() {
+        let err = simplex_volume_in_embedding(&[vec![1.0, 2.0], vec![1.0, 2.0]]).unwrap_err();
+        assert!(matches!(err, GeometryError::DegenerateSimplex));
+    }
+
+    #[test]
+    fn circumsphere_supports_one_dimensional_segment() {
+        let (center, radius) = circumsphere(&[vec![0.0], vec![2.0]]).unwrap();
+        assert_eq!(center, vec![1.0]);
+        assert!((radius - 1.0).abs() < 1e-12);
+    }
 }

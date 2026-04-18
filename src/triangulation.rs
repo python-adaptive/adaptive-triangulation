@@ -345,8 +345,40 @@ fn combinations(
     }
 }
 
+fn scipy_delaunay_simplices(
+    py: Python<'_>,
+    coords: &[Vec<f64>],
+    dim: usize,
+) -> PyResult<Option<Vec<Simplex>>> {
+    if dim == 1 {
+        return Ok(None);
+    }
+
+    let Ok(spatial) = PyModule::import(py, "scipy.spatial") else {
+        return Ok(None);
+    };
+    let coords_array = PyArray2::from_vec2(py, coords)?;
+    let Ok(delaunay) = spatial.getattr("Delaunay")?.call1((coords_array,)) else {
+        return Ok(None);
+    };
+
+    let simplices = delaunay.getattr("simplices")?;
+    let mut initial = Vec::new();
+    for simplex in simplices.try_iter()? {
+        let simplex = simplex?;
+        let mut indices = Vec::new();
+        for item in simplex.try_iter()? {
+            indices.push(item?.extract::<usize>()?);
+        }
+        indices.sort_unstable();
+        initial.push(indices);
+    }
+    Ok(Some(initial))
+}
+
 fn is_close(a: f64, b: f64) -> bool {
-    (a - b).abs() <= 1e-8 + 1e-5 * b.abs()
+    let scale = a.abs().max(b.abs());
+    (a - b).abs() <= DEFAULT_EPS + 1e-5 * scale
 }
 
 #[derive(Debug)]
@@ -381,11 +413,6 @@ impl Triangulation {
         if coords.iter().any(|coord| coord.len() != dim) {
             return Err(TriangulationError::Value(
                 "Coordinates dimension mismatch".to_string(),
-            ));
-        }
-        if dim == 1 {
-            return Err(TriangulationError::Value(
-                "Triangulation class only supports dim >= 2".to_string(),
             ));
         }
         if coords.len() < dim + 1 {
@@ -908,7 +935,7 @@ impl Triangulation {
             simplex.push(pt_index);
             simplex.sort_unstable();
 
-            if self.volume(&simplex)? < 1e-8 {
+            if self.simplex_is_numerically_degenerate(&simplex)? {
                 continue;
             }
             self.add_simplex(simplex)?;
@@ -1060,6 +1087,40 @@ impl Triangulation {
 
     pub fn volume(&self, simplex: &[usize]) -> Result<f64, TriangulationError> {
         Ok(geometry::volume(&self.get_vertices(simplex)?)?)
+    }
+
+    fn normalized_volume(&self, simplex: &[usize]) -> Result<f64, TriangulationError> {
+        let vertices = self.get_vertices(simplex)?;
+        let base = &vertices[0];
+        let mut total_abs_coordinate_delta = 0.0;
+        let mut delta_count = 0usize;
+        for vertex in vertices.iter().skip(1) {
+            for (coord, origin) in vertex.iter().zip(base) {
+                total_abs_coordinate_delta += (coord - origin).abs();
+                delta_count += 1;
+            }
+        }
+
+        if delta_count == 0 {
+            return Ok(0.0);
+        }
+        let characteristic_length = total_abs_coordinate_delta / delta_count as f64;
+        if characteristic_length == 0.0 {
+            return Ok(0.0);
+        }
+
+        Ok(self.volume(simplex)? / characteristic_length.powi(self.dim as i32))
+    }
+
+    fn simplex_is_numerically_degenerate(
+        &self,
+        simplex: &[usize],
+    ) -> Result<bool, TriangulationError> {
+        if self.dim == 1 {
+            // In 1D we only want to reject coincident endpoints, not tiny but valid intervals.
+            return Ok(self.normalized_volume(simplex)? < DEFAULT_EPS);
+        }
+        Ok(self.volume(simplex)? < DEFAULT_EPS)
     }
 
     pub fn has_simplex(&self, simplex: &[usize]) -> Result<bool, TriangulationError> {
@@ -1350,30 +1411,12 @@ impl PyTriangulation {
     fn new(py: Python<'_>, coords: &Bound<'_, PyAny>) -> PyResult<Self> {
         let parsed_coords =
             parse_points_sized(coords, "Please provide a 2-dimensional list of points")?;
-        Triangulation::validate_coords(&parsed_coords).map_err(TriangulationError::into_pyerr)?;
+        let dim = Triangulation::validate_coords(&parsed_coords)
+            .map_err(TriangulationError::into_pyerr)?;
 
-        let core = match PyModule::import(py, "scipy.spatial") {
-            Ok(spatial) => {
-                let coords_array = PyArray2::from_vec2(py, &parsed_coords)?;
-                match spatial.getattr("Delaunay")?.call1((coords_array,)) {
-                    Ok(delaunay) => {
-                        let simplices = delaunay.getattr("simplices")?;
-                        let mut initial = Vec::new();
-                        for simplex in simplices.try_iter()? {
-                            let simplex = simplex?;
-                            let mut indices = Vec::new();
-                            for item in simplex.try_iter()? {
-                                indices.push(item?.extract::<usize>()?);
-                            }
-                            indices.sort_unstable();
-                            initial.push(indices);
-                        }
-                        Triangulation::from_simplices(parsed_coords.clone(), initial)
-                    }
-                    Err(_) => Triangulation::new(parsed_coords.clone()),
-                }
-            }
-            Err(_) => Triangulation::new(parsed_coords.clone()),
+        let core = match scipy_delaunay_simplices(py, &parsed_coords, dim)? {
+            Some(initial) => Triangulation::from_simplices(parsed_coords.clone(), initial),
+            None => Triangulation::new(parsed_coords.clone()),
         }
         .map_err(TriangulationError::into_pyerr)?;
         Ok(Self { core })
@@ -1735,5 +1778,31 @@ mod tests {
         assert_eq!(simplices.len(), 2);
         assert!(simplices.contains(&vec![0, 1, 3]));
         assert!(simplices.contains(&vec![0, 2, 3]));
+    }
+
+    #[test]
+    fn one_dimensional_triangulation_connects_adjacent_points() {
+        let tri = Triangulation::new(vec![vec![2.0], vec![0.0], vec![1.0], vec![3.0]]).unwrap();
+
+        assert_eq!(tri.dim, 1);
+        assert_eq!(
+            tri.simplices,
+            FxHashSet::from_iter([vec![0, 2], vec![1, 2], vec![0, 3]])
+        );
+        assert_eq!(tri.hull().unwrap(), FxHashSet::from_iter([1, 3]));
+        assert!(tri.reference_invariant());
+    }
+
+    #[test]
+    fn one_dimensional_tiny_interval_survives_bowyer_watson() {
+        let mut tri = Triangulation::new(vec![vec![0.0], vec![1e-12]]).unwrap();
+        let (deleted, added) = tri.add_point(vec![5e-13], None, None).unwrap();
+
+        assert_eq!(deleted, FxHashSet::from_iter([vec![0, 1]]));
+        assert_eq!(added, FxHashSet::from_iter([vec![0, 2], vec![1, 2]]));
+        assert_eq!(
+            tri.simplices,
+            FxHashSet::from_iter([vec![0, 2], vec![1, 2]])
+        );
     }
 }

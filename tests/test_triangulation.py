@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import math
 from collections import Counter
 
@@ -25,6 +26,21 @@ def locate_result(value) -> tuple[int, ...]:
 
 def face_counter(iterator) -> Counter[tuple[int, ...]]:
     return Counter(tuple(face) for face in iterator)
+
+
+def expected_1d_order(vertices) -> np.ndarray:
+    coords = np.asarray(vertices, dtype=float).reshape(-1)
+    return np.argsort(coords, kind="mergesort")
+
+
+def expected_1d_simplices(vertices) -> set[tuple[int, int]]:
+    order = expected_1d_order(vertices)
+    return {tuple(sorted((int(left), int(right)))) for left, right in itertools.pairwise(order)}
+
+
+def expected_1d_hull(vertices) -> set[int]:
+    order = expected_1d_order(vertices)
+    return {int(order[0]), int(order[-1])}
 
 
 def assert_points_close(lhs, rhs, atol: float = 1e-8) -> None:
@@ -53,6 +69,20 @@ def assert_same_exception_type_name(rust_callable, reference_callable) -> None:
     with pytest.raises(Exception) as ref_exc:  # noqa: PT011
         reference_callable()
     assert type(rust_exc.value).__name__ == type(ref_exc.value).__name__
+
+
+def assert_1d_triangulation_state(tri) -> None:
+    assert as_simplex_set(tri.simplices) == expected_1d_simplices(tri.vertices)
+    assert set(tri.hull) == expected_1d_hull(tri.vertices)
+    assert tri.reference_invariant() is True
+
+
+def assert_1d_midpoints_locate_adjacent_segments(tri) -> None:
+    vertices = np.asarray(tri.vertices, dtype=float).reshape(-1)
+    order = expected_1d_order(vertices)
+    for left, right in itertools.pairwise(order):
+        midpoint = 0.5 * (vertices[left] + vertices[right])
+        assert locate_result(tri.locate_point([midpoint])) == tuple(sorted((int(left), int(right))))
 
 
 class Seq:
@@ -171,6 +201,45 @@ def test_geometry_functions_match_reference():
     assert fast3_alias_radius == pytest.approx(ref_fast3_radius)
 
 
+def test_geometry_functions_support_1d_segments():
+    segment = np.array([[0.0], [2.0]])
+    embedded_segment = np.array([[0.0, 0.0, 0.0], [3.0, 4.0, 0.0]])
+
+    center, radius = rust_tri.circumsphere(segment)
+    assert_points_close(center, [1.0])
+    assert radius == pytest.approx(1.0)
+
+    assert rust_tri.point_in_simplex([0.5], segment) is True
+    assert rust_tri.point_in_simplex([2.5], segment) is False
+    assert rust_tri.volume(segment) == pytest.approx(2.0)
+    assert rust_tri.simplex_volume_in_embedding(embedded_segment) == pytest.approx(5.0)
+
+    with pytest.raises(ValueError, match="Provided vertices do not form a simplex"):
+        rust_tri.simplex_volume_in_embedding([[1.0, 2.0], [1.0, 2.0]])
+
+
+def test_circumscribed_circle_supports_1d():
+    tri = rust_tri.Triangulation([[0.0], [2.0], [1.0]])
+
+    center, radius = tri.circumscribed_circle((0, 1))
+    assert_points_close(center, [1.0])
+    assert radius == pytest.approx(1.0)
+    assert tri.point_in_circumcircle(2, (0, 1)) is True
+
+    scaled_center, scaled_radius = tri.circumscribed_circle((0, 1), transform=np.array([[2.0]]))
+    assert_points_close(scaled_center, [2.0])
+    assert scaled_radius == pytest.approx(2.0)
+
+
+def test_construction_1d_creates_adjacent_segments():
+    coords = np.array([[2.0], [0.0], [1.0], [3.0]])
+    tri = rust_tri.Triangulation(coords)
+
+    assert tri.dim == 1
+    assert_points_close(tri.vertices, coords)
+    assert_1d_triangulation_state(tri)
+
+
 def test_faces_containing_and_hull_match_reference():
     coords = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.4, 0.2]]
     rust = rust_tri.Triangulation(coords)
@@ -186,6 +255,15 @@ def test_faces_containing_and_hull_match_reference():
     edge = face[:2]
     assert as_simplex_set(rust.containing(edge)) == as_simplex_set(reference.containing(edge))
     assert set(rust.hull) == set(reference.hull)
+
+
+def test_faces_containing_and_hull_work_in_1d():
+    tri = rust_tri.Triangulation([[0.0], [1.0], [2.0]])
+
+    assert face_counter(tri.faces()) == Counter({(0,): 1, (1,): 2, (2,): 1})
+    assert face_counter(tri.faces(dim=1)) == Counter({(0,): 1, (1,): 2, (2,): 1})
+    assert as_simplex_set(tri.containing((1,))) == {(0, 1), (1, 2)}
+    assert_1d_triangulation_state(tri)
 
 
 def test_add_point_inside_hull_matches_reference():
@@ -214,6 +292,51 @@ def test_add_point_outside_hull_matches_reference():
     assert as_simplex_set(rust_deleted) == as_simplex_set(ref_deleted)
     assert as_simplex_set(rust_added) == as_simplex_set(ref_added)
     assert_triangulation_equal(rust, reference)
+
+
+@pytest.mark.parametrize(
+    ("coords", "point", "expected_deleted", "expected_added", "expected_volumes"),
+    [
+        (
+            [[0.0], [2.0]],
+            [1.0],
+            {(0, 1)},
+            {(0, 2), (1, 2)},
+            {},
+        ),
+        (
+            [[0.0], [1.0]],
+            [2.0],
+            set(),
+            {(1, 2)},
+            {},
+        ),
+        (
+            [[0.0], [1e-12]],
+            [5e-13],
+            {(0, 1)},
+            {(0, 2), (1, 2)},
+            {(0, 2): 5e-13, (1, 2): 5e-13},
+        ),
+    ],
+    ids=["inside-hull", "outside-hull", "tiny-interval"],
+)
+def test_add_point_works_in_1d(
+    coords,
+    point,
+    expected_deleted,
+    expected_added,
+    expected_volumes,
+):
+    tri = rust_tri.Triangulation(coords)
+
+    deleted, added = tri.add_point(point)
+
+    assert as_simplex_set(deleted) == expected_deleted
+    assert as_simplex_set(added) == expected_added
+    assert_1d_triangulation_state(tri)
+    for simplex, expected_volume in expected_volumes.items():
+        assert tri.volume(simplex) == pytest.approx(expected_volume)
 
 
 def test_add_point_with_transform_matches_reference():
@@ -272,6 +395,13 @@ def test_duplicate_point_is_rejected():
 
     with pytest.raises(ValueError, match="Point already in triangulation"):
         tri.add_point([0.0, 0.0], simplex=simplex)
+
+
+def test_duplicate_point_is_rejected_in_1d():
+    tri = rust_tri.Triangulation([[0.0], [1.0]])
+
+    with pytest.raises(ValueError, match="Point already in triangulation"):
+        tri.add_point([1.0])
 
 
 def test_random_cross_validation_2d():
@@ -526,15 +656,10 @@ def test_tiny_triangle_point_in_simplex_matches_reference():
 
 
 def test_simplex_volume_in_embedding_matches_reference_edge_case():
-    assert_same_exception_type_name(
-        lambda: rust_tri.simplex_volume_in_embedding([[0.0, 0.0], [1.0, 0.0]]),
-        lambda: reference_module.simplex_volume_in_embedding([[0.0, 0.0], [1.0, 0.0]]),
-    )
+    assert rust_tri.simplex_volume_in_embedding([[0.0, 0.0], [1.0, 0.0]]) == pytest.approx(1.0)
     assert rust_tri.simplex_volume_in_embedding(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
-    ) == pytest.approx(
-        reference_module.simplex_volume_in_embedding([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
-    )
+    ) == pytest.approx(1.0)
 
 
 def test_orientation_matches_reference_at_large_scale():
@@ -624,6 +749,18 @@ def test_random_cross_validation_4d():
         assert as_simplex_set(rust_deleted) == as_simplex_set(ref_deleted)
         assert as_simplex_set(rust_added) == as_simplex_set(ref_added)
         assert_triangulation_equal(rust, reference)
+
+
+def test_random_cross_validation_1d():
+    rng = np.random.default_rng(8642)
+    values = rng.random(10) + np.arange(10) * 1e-6
+    coords = values.reshape(-1, 1)[rng.permutation(10)]
+    tri = rust_tri.Triangulation(coords[:2])
+
+    for point in coords[2:]:
+        tri.add_point(point)
+        assert_1d_triangulation_state(tri)
+        assert_1d_midpoints_locate_adjacent_segments(tri)
 
 
 def test_public_bowyer_watson_is_exposed():
