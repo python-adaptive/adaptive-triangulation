@@ -254,11 +254,7 @@ fn abs_min_log_loss(xs: &[Option<f64>], ys: &[Option<&YValue>]) -> f64 {
     default_loss(xs, &refs)
 }
 
-fn python_callback_loss(
-    callback: &PyObject,
-    xs: &[Option<f64>],
-    ys: &[Option<&YValue>],
-) -> f64 {
+fn python_callback_loss(callback: &PyObject, xs: &[Option<f64>], ys: &[Option<&YValue>]) -> f64 {
     Python::with_gil(|py| {
         let xs_py: Vec<PyObject> = xs
             .iter()
@@ -407,7 +403,10 @@ impl LossManager {
 
     /// Raw loss of the highest-priority interval.
     pub fn peek_max_loss(&self) -> Option<f64> {
-        self.queue.iter().next().map(|entry| self.loss_for_entry(entry))
+        self.queue
+            .iter()
+            .next()
+            .map(|entry| self.loss_for_entry(entry))
     }
 
     /// Iterate entries in priority order (highest loss first).

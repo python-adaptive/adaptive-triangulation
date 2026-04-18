@@ -6,9 +6,7 @@ use std::ops::Bound;
 
 use ordered_float::OrderedFloat;
 
-use self::loss::{
-    compute_loss, finite_loss_value, finite_loss_with_n, LossFunction, LossManager,
-};
+use self::loss::{compute_loss, finite_loss_value, finite_loss_with_n, LossFunction, LossManager};
 
 pub type OF64 = OrderedFloat<f64>;
 
@@ -186,7 +184,9 @@ impl Learner1D {
         if xs.is_empty() {
             return;
         }
-        if !force && !(xs.len() > 2 && xs.len() as f64 > 0.5 * self.data.len() as f64) {
+        let should_rebuild =
+            force || (xs.len() > 2 && xs.len() as f64 > 0.5 * self.data.len() as f64);
+        if !should_rebuild {
             // Incremental path
             for (x, y) in xs.iter().zip(ys.iter()) {
                 self.tell(*x, y.clone());
@@ -219,8 +219,7 @@ impl Learner1D {
         // Rebuild losses
         let real_pts: Vec<OF64> = self.data.keys().copied().collect();
         let comb_pts: Vec<OF64> = self.combined_points.iter().copied().collect();
-        let intervals: Vec<(OF64, OF64)> =
-            real_pts.windows(2).map(|w| (w[0], w[1])).collect();
+        let intervals: Vec<(OF64, OF64)> = real_pts.windows(2).map(|w| (w[0], w[1])).collect();
         let intervals_combined: Vec<(OF64, OF64)> =
             comb_pts.windows(2).map(|w| (w[0], w[1])).collect();
 
@@ -475,10 +474,7 @@ impl Learner1D {
             return 0.0;
         }
         let (xs_raw, ys_raw) = self.get_neighborhood(x_left, x_right);
-        let xs_sc: Vec<Option<f64>> = xs_raw
-            .iter()
-            .map(|x| x.map(|v| v / self.x_scale))
-            .collect();
+        let xs_sc: Vec<Option<f64>> = xs_raw.iter().map(|x| x.map(|v| v / self.x_scale)).collect();
         let ys_scaled: Vec<Option<YValue>> =
             ys_raw.iter().map(|y| y.map(|v| self.scale_y(v))).collect();
         let ys_refs: Vec<Option<&YValue>> = ys_scaled.iter().map(|y| y.as_ref()).collect();
@@ -546,10 +542,8 @@ impl Learner1D {
         }
 
         // Handle unknown-loss edges (pending point with no real neighbour on a side).
-        let left_unknown =
-            x_left.is_none() || (!real && x_right.is_none());
-        let right_unknown =
-            x_right.is_none() || (!real && x_left.is_none());
+        let left_unknown = x_left.is_none() || (!real && x_right.is_none());
+        let right_unknown = x_right.is_none() || (!real && x_left.is_none());
 
         if let Some(a_val) = a {
             if left_unknown {
@@ -594,7 +588,9 @@ impl Learner1D {
             let pts: Vec<f64> = if n == 1 {
                 vec![a]
             } else {
-                (0..n).map(|i| a + (b - a) * i as f64 / (n - 1) as f64).collect()
+                (0..n)
+                    .map(|i| a + (b - a) * i as f64 / (n - 1) as f64)
+                    .collect()
             };
             return (pts, vec![f64::INFINITY; n]);
         }
@@ -647,14 +643,8 @@ impl Learner1D {
                 .map(|x| x.into_inner())
                 .collect();
             let min_pt = all_pts.iter().copied().fold(f64::INFINITY, f64::min);
-            let max_pt = all_pts
-                .iter()
-                .copied()
-                .fold(f64::NEG_INFINITY, f64::max);
-            let bound_intervals = [
-                (self.bounds.0, min_pt),
-                (max_pt, self.bounds.1),
-            ];
+            let max_pt = all_pts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let bound_intervals = [(self.bounds.0, min_pt), (max_pt, self.bounds.1)];
             for (ival, &bound) in bound_intervals.iter().zip(&[self.bounds.0, self.bounds.1]) {
                 if self.is_missing_bound(bound) {
                     insert_qual(
@@ -744,11 +734,11 @@ impl Learner1D {
         let mut improvements: Vec<f64> = Vec::with_capacity(n);
 
         points.extend_from_slice(&missing);
-        improvements.extend(std::iter::repeat(f64::INFINITY).take(missing.len()));
+        improvements.extend(std::iter::repeat_n(f64::INFINITY, missing.len()));
 
-        for (_key, q) in &quals {
+        for q in quals.values() {
             let interior = linspace_interior(q.left, q.right, q.n);
-            improvements.extend(std::iter::repeat(q.loss).take(interior.len()));
+            improvements.extend(std::iter::repeat_n(q.loss, interior.len()));
             points.extend(interior);
         }
 

@@ -73,10 +73,7 @@ impl PyLearner1D {
         ys: Vec<Bound<'_, pyo3::types::PyAny>>,
         force: bool,
     ) -> PyResult<()> {
-        let yvalues: Vec<YValue> = ys
-            .iter()
-            .map(extract_yvalue)
-            .collect::<PyResult<_>>()?;
+        let yvalues: Vec<YValue> = ys.iter().map(extract_yvalue).collect::<PyResult<_>>()?;
         self.inner.tell_many(&xs, &yvalues, force);
         Ok(())
     }
@@ -162,7 +159,9 @@ impl PyLearner1D {
         let data = self.inner.to_sorted_data();
         if data.is_empty() {
             let xs = PyArray1::from_vec(py, vec![]);
-            let ys: PyObject = PyArray1::from_vec(py, Vec::<f64>::new()).into_any().unbind();
+            let ys: PyObject = PyArray1::from_vec(py, Vec::<f64>::new())
+                .into_any()
+                .unbind();
             return Ok((xs, ys));
         }
 
@@ -206,7 +205,12 @@ impl PyLearner1D {
     fn data<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
         let dict = pyo3::types::PyDict::new(py);
         // Include both in-bounds and out-of-bounds data (matches Python behavior)
-        for (&x, y) in self.inner.data.iter().chain(self.inner.out_of_bounds_data.iter()) {
+        for (&x, y) in self
+            .inner
+            .data
+            .iter()
+            .chain(self.inner.out_of_bounds_data.iter())
+        {
             let key = x.into_inner();
             let val: PyObject = match y {
                 YValue::Scalar(v) => v.into_pyobject(py)?.into_any().unbind(),
