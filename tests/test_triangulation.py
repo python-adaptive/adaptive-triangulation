@@ -27,13 +27,22 @@ def face_counter(iterator) -> Counter[tuple[int, ...]]:
     return Counter(tuple(face) for face in iterator)
 
 
-def expected_1d_simplices(vertices) -> set[tuple[int, int]]:
+def expected_1d_order(vertices) -> np.ndarray:
     coords = np.asarray(vertices, dtype=float).reshape(-1)
-    order = np.argsort(coords, kind="mergesort")
+    return np.argsort(coords, kind="mergesort")
+
+
+def expected_1d_simplices(vertices) -> set[tuple[int, int]]:
+    order = expected_1d_order(vertices)
     return {
         tuple(sorted((int(left), int(right))))
         for left, right in zip(order, order[1:])
     }
+
+
+def expected_1d_hull(vertices) -> set[int]:
+    order = expected_1d_order(vertices)
+    return {int(order[0]), int(order[-1])}
 
 
 def assert_points_close(lhs, rhs, atol: float = 1e-8) -> None:
@@ -62,6 +71,22 @@ def assert_same_exception_type_name(rust_callable, reference_callable) -> None:
     with pytest.raises(Exception) as ref_exc:  # noqa: PT011
         reference_callable()
     assert type(rust_exc.value).__name__ == type(ref_exc.value).__name__
+
+
+def assert_1d_triangulation_state(tri) -> None:
+    assert as_simplex_set(tri.simplices) == expected_1d_simplices(tri.vertices)
+    assert set(tri.hull) == expected_1d_hull(tri.vertices)
+    assert tri.reference_invariant() is True
+
+
+def assert_1d_midpoints_locate_adjacent_segments(tri) -> None:
+    vertices = np.asarray(tri.vertices, dtype=float).reshape(-1)
+    order = expected_1d_order(vertices)
+    for left, right in zip(order, order[1:]):
+        midpoint = 0.5 * (vertices[left] + vertices[right])
+        assert locate_result(tri.locate_point([midpoint])) == tuple(
+            sorted((int(left), int(right)))
+        )
 
 
 class Seq:
@@ -216,9 +241,7 @@ def test_construction_1d_creates_adjacent_segments():
 
     assert tri.dim == 1
     assert_points_close(tri.vertices, coords)
-    assert as_simplex_set(tri.simplices) == expected_1d_simplices(coords)
-    assert set(tri.hull) == {1, 3}
-    assert tri.reference_invariant() is True
+    assert_1d_triangulation_state(tri)
 
 
 def test_faces_containing_and_hull_match_reference():
@@ -244,7 +267,7 @@ def test_faces_containing_and_hull_work_in_1d():
     assert face_counter(tri.faces()) == Counter({(0,): 1, (1,): 2, (2,): 1})
     assert face_counter(tri.faces(dim=1)) == Counter({(0,): 1, (1,): 2, (2,): 1})
     assert as_simplex_set(tri.containing((1,))) == {(0, 1), (1, 2)}
-    assert set(tri.hull) == {0, 2}
+    assert_1d_triangulation_state(tri)
 
 
 def test_add_point_inside_hull_matches_reference():
@@ -261,18 +284,6 @@ def test_add_point_inside_hull_matches_reference():
     assert_triangulation_equal(rust, reference)
 
 
-def test_add_point_inside_hull_works_in_1d():
-    tri = rust_tri.Triangulation([[0.0], [2.0]])
-
-    deleted, added = tri.add_point([1.0])
-
-    assert as_simplex_set(deleted) == {(0, 1)}
-    assert as_simplex_set(added) == {(0, 2), (1, 2)}
-    assert as_simplex_set(tri.simplices) == {(0, 2), (1, 2)}
-    assert set(tri.hull) == {0, 1}
-    assert tri.reference_invariant() is True
-
-
 def test_add_point_outside_hull_matches_reference():
     coords = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.3, 0.3]]
     point = [1.5, 0.5]
@@ -287,16 +298,49 @@ def test_add_point_outside_hull_matches_reference():
     assert_triangulation_equal(rust, reference)
 
 
-def test_add_point_outside_hull_works_in_1d():
-    tri = rust_tri.Triangulation([[0.0], [1.0]])
+@pytest.mark.parametrize(
+    ("coords", "point", "expected_deleted", "expected_added", "expected_volumes"),
+    [
+        (
+            [[0.0], [2.0]],
+            [1.0],
+            {(0, 1)},
+            {(0, 2), (1, 2)},
+            {},
+        ),
+        (
+            [[0.0], [1.0]],
+            [2.0],
+            set(),
+            {(1, 2)},
+            {},
+        ),
+        (
+            [[0.0], [1e-12]],
+            [5e-13],
+            {(0, 1)},
+            {(0, 2), (1, 2)},
+            {(0, 2): 5e-13, (1, 2): 5e-13},
+        ),
+    ],
+    ids=["inside-hull", "outside-hull", "tiny-interval"],
+)
+def test_add_point_works_in_1d(
+    coords,
+    point,
+    expected_deleted,
+    expected_added,
+    expected_volumes,
+):
+    tri = rust_tri.Triangulation(coords)
 
-    deleted, added = tri.add_point([2.0])
+    deleted, added = tri.add_point(point)
 
-    assert as_simplex_set(deleted) == set()
-    assert as_simplex_set(added) == {(1, 2)}
-    assert as_simplex_set(tri.simplices) == {(0, 1), (1, 2)}
-    assert set(tri.hull) == {0, 2}
-    assert tri.reference_invariant() is True
+    assert as_simplex_set(deleted) == expected_deleted
+    assert as_simplex_set(added) == expected_added
+    assert_1d_triangulation_state(tri)
+    for simplex, expected_volume in expected_volumes.items():
+        assert tri.volume(simplex) == pytest.approx(expected_volume)
 
 
 def test_add_point_with_transform_matches_reference():
@@ -719,31 +763,8 @@ def test_random_cross_validation_1d():
 
     for point in coords[2:]:
         tri.add_point(point)
-        expected = expected_1d_simplices(tri.vertices)
-        assert as_simplex_set(tri.simplices) == expected
-        order = np.argsort(np.asarray(tri.vertices, dtype=float).reshape(-1), kind="mergesort")
-        assert set(tri.hull) == {int(order[0]), int(order[-1])}
-        assert tri.reference_invariant() is True
-
-        sorted_vertices = np.asarray(tri.vertices, dtype=float).reshape(-1)
-        for left, right in zip(order, order[1:]):
-            midpoint = 0.5 * (sorted_vertices[left] + sorted_vertices[right])
-            assert locate_result(tri.locate_point([midpoint])) == tuple(
-                sorted((int(left), int(right)))
-            )
-
-
-def test_tiny_intervals_work_in_1d():
-    tri = rust_tri.Triangulation([[0.0], [1e-12]])
-
-    deleted, added = tri.add_point([5e-13])
-
-    assert as_simplex_set(deleted) == {(0, 1)}
-    assert as_simplex_set(added) == {(0, 2), (1, 2)}
-    assert as_simplex_set(tri.simplices) == {(0, 2), (1, 2)}
-    assert tri.volume((0, 2)) == pytest.approx(5e-13)
-    assert tri.volume((1, 2)) == pytest.approx(5e-13)
-    assert tri.reference_invariant() is True
+        assert_1d_triangulation_state(tri)
+        assert_1d_midpoints_locate_adjacent_segments(tri)
 
 
 def test_public_bowyer_watson_is_exposed():
