@@ -345,6 +345,37 @@ fn combinations(
     }
 }
 
+fn scipy_delaunay_simplices(
+    py: Python<'_>,
+    coords: &[Vec<f64>],
+    dim: usize,
+) -> PyResult<Option<Vec<Simplex>>> {
+    if dim == 1 {
+        return Ok(None);
+    }
+
+    let Ok(spatial) = PyModule::import(py, "scipy.spatial") else {
+        return Ok(None);
+    };
+    let coords_array = PyArray2::from_vec2(py, coords)?;
+    let Ok(delaunay) = spatial.getattr("Delaunay")?.call1((coords_array,)) else {
+        return Ok(None);
+    };
+
+    let simplices = delaunay.getattr("simplices")?;
+    let mut initial = Vec::new();
+    for simplex in simplices.try_iter()? {
+        let simplex = simplex?;
+        let mut indices = Vec::new();
+        for item in simplex.try_iter()? {
+            indices.push(item?.extract::<usize>()?);
+        }
+        indices.sort_unstable();
+        initial.push(indices);
+    }
+    Ok(Some(initial))
+}
+
 fn is_close(a: f64, b: f64) -> bool {
     let scale = a.abs().max(b.abs());
     (a - b).abs() <= DEFAULT_EPS + 1e-5 * scale
@@ -904,7 +935,7 @@ impl Triangulation {
             simplex.push(pt_index);
             simplex.sort_unstable();
 
-            if self.simplex_is_almost_flat(&simplex)? {
+            if self.simplex_is_numerically_degenerate(&simplex)? {
                 continue;
             }
             self.add_simplex(simplex)?;
@@ -1058,32 +1089,36 @@ impl Triangulation {
         Ok(geometry::volume(&self.get_vertices(simplex)?)?)
     }
 
-    fn relative_volume(&self, simplex: &[usize]) -> Result<f64, TriangulationError> {
+    fn normalized_volume(&self, simplex: &[usize]) -> Result<f64, TriangulationError> {
         let vertices = self.get_vertices(simplex)?;
         let base = &vertices[0];
-        let mut total_abs = 0.0;
-        let mut count = 0usize;
+        let mut total_abs_coordinate_delta = 0.0;
+        let mut delta_count = 0usize;
         for vertex in vertices.iter().skip(1) {
             for (coord, origin) in vertex.iter().zip(base) {
-                total_abs += (coord - origin).abs();
-                count += 1;
+                total_abs_coordinate_delta += (coord - origin).abs();
+                delta_count += 1;
             }
         }
 
-        if count == 0 {
+        if delta_count == 0 {
             return Ok(0.0);
         }
-        let average_edge_length = total_abs / count as f64;
-        if average_edge_length == 0.0 {
+        let characteristic_length = total_abs_coordinate_delta / delta_count as f64;
+        if characteristic_length == 0.0 {
             return Ok(0.0);
         }
 
-        Ok(self.volume(simplex)? / average_edge_length.powi(self.dim as i32))
+        Ok(self.volume(simplex)? / characteristic_length.powi(self.dim as i32))
     }
 
-    fn simplex_is_almost_flat(&self, simplex: &[usize]) -> Result<bool, TriangulationError> {
+    fn simplex_is_numerically_degenerate(
+        &self,
+        simplex: &[usize],
+    ) -> Result<bool, TriangulationError> {
         if self.dim == 1 {
-            return Ok(self.relative_volume(simplex)? < DEFAULT_EPS);
+            // In 1D we only want to reject coincident endpoints, not tiny but valid intervals.
+            return Ok(self.normalized_volume(simplex)? < DEFAULT_EPS);
         }
         Ok(self.volume(simplex)? < DEFAULT_EPS)
     }
@@ -1379,32 +1414,9 @@ impl PyTriangulation {
         let dim = Triangulation::validate_coords(&parsed_coords)
             .map_err(TriangulationError::into_pyerr)?;
 
-        let core = if dim == 1 {
-            Triangulation::new(parsed_coords.clone())
-        } else {
-            match PyModule::import(py, "scipy.spatial") {
-                Ok(spatial) => {
-                    let coords_array = PyArray2::from_vec2(py, &parsed_coords)?;
-                    match spatial.getattr("Delaunay")?.call1((coords_array,)) {
-                        Ok(delaunay) => {
-                            let simplices = delaunay.getattr("simplices")?;
-                            let mut initial = Vec::new();
-                            for simplex in simplices.try_iter()? {
-                                let simplex = simplex?;
-                                let mut indices = Vec::new();
-                                for item in simplex.try_iter()? {
-                                    indices.push(item?.extract::<usize>()?);
-                                }
-                                indices.sort_unstable();
-                                initial.push(indices);
-                            }
-                            Triangulation::from_simplices(parsed_coords.clone(), initial)
-                        }
-                        Err(_) => Triangulation::new(parsed_coords.clone()),
-                    }
-                }
-                Err(_) => Triangulation::new(parsed_coords.clone()),
-            }
+        let core = match scipy_delaunay_simplices(py, &parsed_coords, dim)? {
+            Some(initial) => Triangulation::from_simplices(parsed_coords.clone(), initial),
+            None => Triangulation::new(parsed_coords.clone()),
         }
         .map_err(TriangulationError::into_pyerr)?;
         Ok(Self { core })
