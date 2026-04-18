@@ -6,7 +6,6 @@ import math
 
 import numpy as np
 import pytest
-
 from adaptive_triangulation import Learner1D
 
 
@@ -22,6 +21,10 @@ def vector_fn(x: float) -> list[float]:
     return [math.sin(x), math.cos(x)]
 
 
+class IntentionalLossError(ValueError):
+    pass
+
+
 def make_learner(bounds=(0.0, 1.0), points=()):
     learner = Learner1D(bounds=bounds)
     for x, y in points:
@@ -35,15 +38,15 @@ def unit_interval_learner() -> Learner1D:
 
 def assert_points_close(points, expected) -> None:
     assert len(points) == len(expected)
-    for point, expected_point in zip(sorted(points), expected):
+    for point, expected_point in zip(sorted(points), expected, strict=True):
         assert point == pytest.approx(expected_point)
 
 
-def bad_loss(xs, ys):
-    raise ValueError("intentional error")
+def bad_loss(_xs, _ys):
+    raise IntentionalLossError
 
 
-def string_loss(xs, ys):
+def string_loss(_xs, _ys):
     return "not a float"
 
 
@@ -55,7 +58,7 @@ def test_create(bounds) -> None:
 
 
 def test_invalid_bounds() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"bounds\[0\] must be strictly less than bounds\[1\]"):
         Learner1D(bounds=(1.0, 0.0))
 
 
@@ -121,7 +124,7 @@ def test_tell_many_incremental_path() -> None:
 
 
 @pytest.mark.parametrize("force", [False, True])
-def test_tell_many_force_rebuild(force: bool) -> None:
+def test_tell_many_force_rebuild(force) -> None:
     learner = make_learner()
     xs = [i / 10 for i in range(11)]
     ys = [x**2 for x in xs]
@@ -161,7 +164,7 @@ def test_tell_pending_and_tell_clears_pending() -> None:
 
 
 @pytest.mark.parametrize(("tell_pending", "expected_pending"), [(True, 2), (False, 0)])
-def test_ask_pending_mode(tell_pending: bool, expected_pending: int) -> None:
+def test_ask_pending_mode(tell_pending, expected_pending: int) -> None:
     learner = unit_interval_learner()
     points, _ = learner.ask(2, tell_pending=tell_pending)
     assert len(points) == 2
@@ -275,7 +278,7 @@ def test_scale_recompute_triggers_on_large_y_change() -> None:
 
 @pytest.mark.parametrize("y_right", [1.0, 100.0])
 def test_uniform_loss_callback(y_right: float) -> None:
-    def my_uniform(xs, ys):
+    def my_uniform(xs, _ys):
         return xs[1] - xs[0]
 
     learner = Learner1D(bounds=(0.0, 1.0), loss_per_interval=my_uniform)
@@ -286,7 +289,7 @@ def test_uniform_loss_callback(y_right: float) -> None:
 
 
 def test_custom_loss_run() -> None:
-    def my_loss(xs, ys):
+    def my_loss(xs, _ys):
         return abs(xs[1] - xs[0])
 
     learner = Learner1D(bounds=(0.0, 1.0), loss_per_interval=my_loss)
@@ -345,7 +348,7 @@ def test_full_adaptive_loop() -> None:
     assert learner.npoints > 0
     xs, ys = learner.to_numpy()
     assert all(xs[i] <= xs[i + 1] for i in range(len(xs) - 1))
-    for x, y in zip(xs, ys):
+    for x, y in zip(xs, ys, strict=True):
         assert y == pytest.approx(sin10(x))
 
 

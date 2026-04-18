@@ -6,7 +6,10 @@ fn main() {
         .unwrap_or_else(|_| "python3".to_owned());
 
     let Ok(output) = Command::new(&python)
-        .args(["-c", "import sysconfig; print(sysconfig.get_config_var('LIBDIR') or '')"])
+        .args([
+            "-c",
+            "import sysconfig; print(sysconfig.get_config_var('LIBDIR') or '')",
+        ])
         .output()
     else {
         return;

@@ -60,6 +60,7 @@ select = ["ALL"]
 ignore = ["D", "COM812", "ISC001"]
 
 [tool.ruff.lint.per-file-ignores]
+"benches/*" = ["INP001", "T201", "ANN", "E741", "PLR2004", "E731"]
 "tests/*" = ["S101", "PLR2004", "ANN"]
 "examples/*" = ["INP001", "T201", "S101", "N813", "RUF001", "RUF002", "SIM105", "PERF203"]
 

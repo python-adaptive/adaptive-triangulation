@@ -17,7 +17,7 @@ def bench(name: str, fn, *, n_iter: int = 10):
         times.append(time.perf_counter() - t0)
     times.sort()
     median = times[len(times) // 2]
-    print(f"  {name}: {median*1000:.2f} ms (median of {n_iter})")
+    print(f"  {name}: {median * 1000:.2f} ms (median of {n_iter})")
     return median
 
 
