@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import math
 from collections import Counter
 
@@ -34,10 +35,7 @@ def expected_1d_order(vertices) -> np.ndarray:
 
 def expected_1d_simplices(vertices) -> set[tuple[int, int]]:
     order = expected_1d_order(vertices)
-    return {
-        tuple(sorted((int(left), int(right))))
-        for left, right in zip(order, order[1:])
-    }
+    return {tuple(sorted((int(left), int(right)))) for left, right in itertools.pairwise(order)}
 
 
 def expected_1d_hull(vertices) -> set[int]:
@@ -82,11 +80,9 @@ def assert_1d_triangulation_state(tri) -> None:
 def assert_1d_midpoints_locate_adjacent_segments(tri) -> None:
     vertices = np.asarray(tri.vertices, dtype=float).reshape(-1)
     order = expected_1d_order(vertices)
-    for left, right in zip(order, order[1:]):
+    for left, right in itertools.pairwise(order):
         midpoint = 0.5 * (vertices[left] + vertices[right])
-        assert locate_result(tri.locate_point([midpoint])) == tuple(
-            sorted((int(left), int(right)))
-        )
+        assert locate_result(tri.locate_point([midpoint])) == tuple(sorted((int(left), int(right))))
 
 
 class Seq:
@@ -661,9 +657,9 @@ def test_tiny_triangle_point_in_simplex_matches_reference():
 
 def test_simplex_volume_in_embedding_matches_reference_edge_case():
     assert rust_tri.simplex_volume_in_embedding([[0.0, 0.0], [1.0, 0.0]]) == pytest.approx(1.0)
-    assert rust_tri.simplex_volume_in_embedding([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]) == pytest.approx(
-        1.0
-    )
+    assert rust_tri.simplex_volume_in_embedding(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+    ) == pytest.approx(1.0)
 
 
 def test_orientation_matches_reference_at_large_scale():
