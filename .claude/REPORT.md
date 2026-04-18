@@ -1,85 +1,53 @@
-# Code Review Fix Report: Rust Learner1D Implementation
+# ISSUE-096 Cleanup Report
 
-**Branch:** `issue-096-impl`
-**Status:** All review findings addressed, all tests passing (56/56)
+## Line counts
 
----
+- `src/learner1d/mod.rs`: `833 -> 783` (`-50`)
+- `src/learner1d/loss.rs`: `448 -> 428` (`-20`)
+- `src/learner1d/python.rs`: `239 -> 229` (`-10`)
+- `tests/test_learner1d.py`: `600 -> 399` (`-201`)
+- Total: `2120 -> 1839` (`-281`)
 
-## Fixes Applied
+## Specific simplifications made
 
-### Fix #1 (CRITICAL) — `python_callback_loss` panic on exceptions
-**File:** `src/learner1d/loss.rs:282-289`
+- `src/learner1d/mod.rs`
+  - Removed the dedicated `missing_bounds` cache and derive missing bounds directly from `bounds`, `data`, and `pending`.
+  - Collapsed duplicate `vdim` detection and y-scale recomputation logic.
+  - Simplified the `tell_many` rebuild path by removing repeated interval checks and trimming dead bookkeeping in `remove_unfinished`.
+  - Replaced a few manual padding loops with `resize`, which made the neighborhood-building code shorter and easier to scan.
 
-Replaced `.expect()` calls with `match` + `unwrap_or_else` error handling. When a Python
-callback raises an exception or returns a non-float, the error is printed to stderr via
-`err.print(py)` and `f64::INFINITY` is returned as a fallback loss. This prevents process
-crashes and preserves the Python traceback for debugging.
+- `src/learner1d/loss.rs`
+  - Removed unused `LossManager` surface (`contains`, `len`, `is_empty`, `clear`).
+  - Centralized the interval lookup used by `peek_max_loss` and `iter_by_priority`.
+  - Simplified curvature loss to reuse the existing interval slices instead of constructing temporary arrays.
 
-### Fix #2 (HIGH) — Out-of-bounds data polluting neighbor queries
-**File:** `src/learner1d/mod.rs`
+- `src/learner1d/python.rs`
+  - Removed unused `Python` handles from `tell` and `tell_many`.
+  - Collapsed the `run` evaluation loop into a single `collect::<PyResult<_>>()`.
+  - Simplified vector `to_numpy` conversion by building rows directly instead of flattening and rechunking.
 
-Added `out_of_bounds_data: HashMap<OF64, YValue>` field to `Learner1D`. In `tell()` and
-`tell_many()`, points outside bounds are stored in `out_of_bounds_data` instead of `data`
-(BTreeMap). This prevents OOB points from appearing in `find_real_neighbors()` queries,
-which would have created incorrect loss intervals extending beyond bounds. The `data`
-Python property and `npoints()` include OOB data for API compatibility.
+- `tests/test_learner1d.py`
+  - Replaced repeated learner setup with small helpers.
+  - Merged the obvious near-duplicates into parametrized tests.
+  - Kept the focused suite at `56` collected cases while cutting `201` lines.
 
-### Fix #3 (HIGH) — `x_scale` stale after `tell_many(force=True)` rebuild
-**File:** `src/learner1d/mod.rs`
+- Verification plumbing
+  - Moved `pyo3/extension-module` out of the default Cargo dependency features so `cargo test --release` links a runnable test binary.
+  - Added a tiny `build.rs` rpath hook so the Rust test binary can find `libpython` in this workspace without changing the `maturin` build path.
 
-Changed `rebuild_scale()` to always set `x_scale = bounds.1 - bounds.0` (the constant
-domain width) instead of computing it from the span of combined points. This matches the
-Python behavior and ensures `x_scale` is never stale after a rebuild followed by
-incremental tells.
+## Considered cutting, but didn't
 
-### Fix #4 (MEDIUM) — `loss` property doesn't expose `real` parameter
-**File:** `src/learner1d/python.rs:147-149`
+- Replacing the explicit `LossFunction::Clone` impl with `#[derive(Clone)]`.
+  - Not viable with the current PyO3 version here because `PyObject` does not implement `Clone`.
 
-Changed `loss` from a `#[getter]` property to a method with
-`#[pyo3(signature = (real=true))]`. Users can now call `loss(real=False)` to get the
-combined loss accounting for pending points. Updated all test references from `l.loss` to
-`l.loss()`.
+- Pushing scalar/vector handling behind a larger `YValue` helper API.
+  - It would have spread more abstraction across the core learner code and made the files longer.
 
-### Fix #5 (MEDIUM) — Empty learner `ask(n>2)` linspace missing right endpoint
-**File:** `src/learner1d/mod.rs`
+- Removing the small Rust unit tests in `src/learner1d/mod.rs`.
+  - They are already tiny and still provide direct coverage for the simplest ask/linspace behavior.
 
-Changed the linspace formula from `a + step * i` (which misses the right endpoint) to
-`a + (b - a) * i / (n - 1)` which matches `np.linspace(a, b, n)` and includes both
-endpoints.
+## Verification
 
-### Fix #6 (MEDIUM) — Ask tiebreaking differs from Python
-**File:** `src/learner1d/mod.rs`
-
-Updated the `prefer_combined` comparison in `ask()` to use lexicographic `(loss, interval)`
-comparison when finite losses are equal, matching Python's tuple comparison behavior.
-
-### Fix #7 (LOW) — `has_missing_bounds` allocates Vec unnecessarily
-**File:** `src/learner1d/mod.rs`
-
-Replaced `self.get_missing_bounds_list().iter().any(|_| true)` with a direct iterator
-check on `self.missing_bounds` using `.any()`, eliminating the Vec allocation and sort.
-
-### Fix #8 (LOW) — `rebuild_scale` clones all data values
-**File:** `src/learner1d/mod.rs`
-
-Extracted y-bounds tracking into a free function `update_y_bounds()` that takes mutable
-references to `y_min`/`y_max` vectors. This allows `rebuild_scale()` to iterate
-`self.data.values()` by reference without cloning, resolving the borrow checker issue
-that originally required the clone.
-
----
-
-## Test Results
-
-```
-56 passed in 0.15s
-```
-
-### New Tests Added (12)
-- `TestOutOfBounds` (5 tests): OOB tells don't affect loss, are stored in data, counted
-  in npoints, don't appear as neighbors, duplicates ignored
-- `TestCallbackException` (2 tests): Exception returns infinity, wrong return type
-  returns infinity
-- `TestLossRealParam` (3 tests): `loss(real=True)`, `loss(real=False)` with pending,
-  default is real
-- `TestLinspaceEndpoint` (2 tests): Empty ask includes right endpoint for n=3 and n=5
+- `uv tool run maturin develop --release`
+- `uv run pytest tests/test_learner1d.py -x --tb=short` -> `56 passed`
+- `cargo test --release` -> `4 passed`, `0 failed`

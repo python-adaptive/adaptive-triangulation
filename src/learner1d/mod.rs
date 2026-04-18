@@ -46,9 +46,6 @@ pub struct Learner1D {
     nth_neighbors: usize,
     pub(crate) vdim: Option<usize>,
     dx_eps: f64,
-
-    // Bounds tracking
-    missing_bounds: BTreeSet<OF64>,
 }
 
 // ---- BTreeMap / BTreeSet neighbour helpers ----
@@ -119,9 +116,6 @@ impl Learner1D {
         let x_scale = bounds.1 - bounds.0;
         let nth_neighbors = loss_fn.nth_neighbors();
         let dx_eps = 2.0 * f64::max(bounds.0.abs(), bounds.1.abs()) * f64::EPSILON;
-        let mut missing = BTreeSet::new();
-        missing.insert(OF64::from(bounds.0));
-        missing.insert(OF64::from(bounds.1));
         Self {
             data: BTreeMap::new(),
             out_of_bounds_data: HashMap::new(),
@@ -139,7 +133,6 @@ impl Learner1D {
             nth_neighbors,
             vdim: None,
             dx_eps,
-            missing_bounds: missing,
         }
     }
 
@@ -153,13 +146,7 @@ impl Learner1D {
             return;
         }
 
-        // Detect vdim from first data point
-        if self.vdim.is_none() {
-            self.vdim = Some(match &y {
-                YValue::Scalar(_) => 1,
-                YValue::Vector(v) => v.len(),
-            });
-        }
+        self.set_vdim_if_unknown(&y);
 
         self.pending.remove(&xo);
 
@@ -174,15 +161,9 @@ impl Learner1D {
         self.update_scale(&y);
         self.update_losses(xo, true);
 
-        // Full recompute if y-scale doubled
-        if self.old_y_scale > 0.0 && self.y_scale > 2.0 * self.old_y_scale {
-            let ivals: Vec<(OF64, OF64)> = self.losses.all_intervals();
-            for (l, r) in ivals {
-                self.update_interpolated_loss_in_interval(l, r);
-            }
-            self.old_y_scale = self.y_scale;
-        } else if self.old_y_scale == 0.0 && self.y_scale > 0.0 {
-            // First time y_scale becomes nonzero
+        let should_recompute = (self.old_y_scale == 0.0 && self.y_scale > 0.0)
+            || (self.old_y_scale > 0.0 && self.y_scale > 2.0 * self.old_y_scale);
+        if should_recompute {
             let ivals: Vec<(OF64, OF64)> = self.losses.all_intervals();
             for (l, r) in ivals {
                 self.update_interpolated_loss_in_interval(l, r);
@@ -216,20 +197,11 @@ impl Learner1D {
         for (x, y) in xs.iter().zip(ys.iter()) {
             let xo = OF64::from(*x);
             self.pending.remove(&xo);
+            self.set_vdim_if_unknown(y);
             if !(self.bounds.0 <= *x && *x <= self.bounds.1) {
                 self.out_of_bounds_data.insert(xo, y.clone());
             } else {
                 self.data.insert(xo, y.clone());
-            }
-        }
-
-        // Detect vdim
-        if self.vdim.is_none() {
-            if let Some(y) = ys.first() {
-                self.vdim = Some(match y {
-                    YValue::Scalar(_) => 1,
-                    YValue::Vector(v) => v.len(),
-                });
             }
         }
 
@@ -261,25 +233,20 @@ impl Learner1D {
         self.losses_combined = LossManager::new(self.x_scale);
         let mut to_interpolate: Vec<(OF64, OF64)> = Vec::new();
         for &(l, r) in &intervals_combined {
-            if self.losses.contains(l, r) {
-                let loss = self.losses.get(l, r).unwrap();
-                self.losses_combined.insert(l, r, loss);
-            } else {
-                self.losses_combined.insert(l, r, f64::INFINITY);
-                let can_extend = if let Some(last) = to_interpolate.last() {
-                    last.1 == l && !self.losses.contains(last.0, last.1)
-                } else {
-                    false
-                };
-                if can_extend {
-                    to_interpolate.last_mut().unwrap().1 = r;
-                } else {
-                    to_interpolate.push((l, r));
+            match self.losses.get(l, r) {
+                Some(loss) => self.losses_combined.insert(l, r, loss),
+                None => {
+                    self.losses_combined.insert(l, r, f64::INFINITY);
+                    if matches!(to_interpolate.last(), Some((_, last_right)) if *last_right == l) {
+                        to_interpolate.last_mut().unwrap().1 = r;
+                    } else {
+                        to_interpolate.push((l, r));
+                    }
                 }
             }
         }
         for (l, r) in to_interpolate {
-            if self.losses.contains(l, r) {
+            if self.losses.get(l, r).is_some() {
                 self.update_interpolated_loss_in_interval(l, r);
             }
         }
@@ -298,7 +265,7 @@ impl Learner1D {
     }
 
     pub fn loss(&self, real: bool) -> f64 {
-        if self.has_missing_bounds() {
+        if self.is_missing_bound(self.bounds.0) || self.is_missing_bound(self.bounds.1) {
             return f64::INFINITY;
         }
         let mgr = if real {
@@ -314,12 +281,8 @@ impl Learner1D {
     }
 
     pub fn remove_unfinished(&mut self) {
-        for &x in &self.pending {
-            self.combined_points.remove(&x);
-        }
         self.pending.clear();
         self.losses_combined = self.losses.clone();
-        // Rebuild combined_points from data only
         self.combined_points = self.data.keys().copied().collect();
     }
 
@@ -348,8 +311,16 @@ impl Learner1D {
     //  Internal: scale management
     // ----------------------------------------------------------------
 
-    fn update_scale(&mut self, y: &YValue) {
-        update_y_bounds(&mut self.y_min, &mut self.y_max, y);
+    fn set_vdim_if_unknown(&mut self, y: &YValue) {
+        if self.vdim.is_none() {
+            self.vdim = Some(match y {
+                YValue::Scalar(_) => 1,
+                YValue::Vector(values) => values.len(),
+            });
+        }
+    }
+
+    fn refresh_y_scale(&mut self) {
         self.y_scale = self
             .y_min
             .iter()
@@ -358,18 +329,18 @@ impl Learner1D {
             .fold(0.0_f64, f64::max);
     }
 
+    fn update_scale(&mut self, y: &YValue) {
+        update_y_bounds(&mut self.y_min, &mut self.y_max, y);
+        self.refresh_y_scale();
+    }
+
     fn rebuild_scale(&mut self) {
         self.y_min.clear();
         self.y_max.clear();
         for y in self.data.values() {
             update_y_bounds(&mut self.y_min, &mut self.y_max, y);
         }
-        self.y_scale = self
-            .y_min
-            .iter()
-            .zip(self.y_max.iter())
-            .map(|(lo, hi)| hi - lo)
-            .fold(0.0_f64, f64::max);
+        self.refresh_y_scale();
         // x_scale is always the domain width (matches Python where x_scale = bounds[1] - bounds[0])
         self.x_scale = self.bounds.1 - self.bounds.0;
         self.old_y_scale = self.y_scale;
@@ -462,10 +433,7 @@ impl Learner1D {
                 break;
             }
         }
-        // Pad with None if we ran out of neighbors
-        while before_x.len() < nn {
-            before_x.push(None);
-        }
+        before_x.resize(nn, None);
         before_x.reverse();
 
         for p in &before_x {
@@ -491,10 +459,8 @@ impl Learner1D {
                 break;
             }
         }
-        while xs.len() < 2 + 2 * nn {
-            xs.push(None);
-            ys.push(None);
-        }
+        xs.resize(2 + 2 * nn, None);
+        ys.resize(2 + 2 * nn, None);
 
         (xs, ys)
     }
@@ -601,23 +567,16 @@ impl Learner1D {
     //  Internal: ask algorithm
     // ----------------------------------------------------------------
 
-    fn has_missing_bounds(&self) -> bool {
-        self.missing_bounds.iter().any(|b| !self.data.contains_key(b) && !self.pending.contains(b))
+    fn is_missing_bound(&self, bound: f64) -> bool {
+        let bound = OF64::from(bound);
+        !self.data.contains_key(&bound) && !self.pending.contains(&bound)
     }
 
-    fn get_missing_bounds_list(&self) -> Vec<f64> {
-        let mut out = Vec::new();
-        for &b in &self.missing_bounds {
-            if self.data.contains_key(&b) {
-                continue; // evaluated
-            }
-            if self.pending.contains(&b) {
-                continue; // being evaluated
-            }
-            out.push(b.into_inner());
-        }
-        out.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        out
+    fn missing_bounds(&self) -> Vec<f64> {
+        [self.bounds.0, self.bounds.1]
+            .into_iter()
+            .filter(|&bound| self.is_missing_bound(bound))
+            .collect()
     }
 
     fn ask_points_without_adding(&self, n: usize) -> (Vec<f64>, Vec<f64>) {
@@ -625,8 +584,7 @@ impl Learner1D {
             return (vec![], vec![]);
         }
 
-        // Refresh missing-bounds state
-        let missing = self.get_missing_bounds_list();
+        let missing = self.missing_bounds();
         if missing.len() >= n {
             return (missing[..n].to_vec(), vec![f64::INFINITY; n]);
         }
@@ -698,11 +656,7 @@ impl Learner1D {
                 (max_pt, self.bounds.1),
             ];
             for (ival, &bound) in bound_intervals.iter().zip(&[self.bounds.0, self.bounds.1]) {
-                let bo = OF64::from(bound);
-                if self.missing_bounds.contains(&bo)
-                    && !self.data.contains_key(&bo)
-                    && !self.pending.contains(&bo)
-                {
+                if self.is_missing_bound(bound) {
                     insert_qual(
                         &mut quals,
                         Qual {
@@ -789,16 +743,12 @@ impl Learner1D {
         let mut points: Vec<f64> = Vec::with_capacity(n);
         let mut improvements: Vec<f64> = Vec::with_capacity(n);
 
-        // Add missing bounds first
         points.extend_from_slice(&missing);
         improvements.extend(std::iter::repeat(f64::INFINITY).take(missing.len()));
 
         for (_key, q) in &quals {
             let interior = linspace_interior(q.left, q.right, q.n);
-            let loss_val = q.loss;
-            for _ in 0..interior.len() {
-                improvements.push(loss_val);
-            }
+            improvements.extend(std::iter::repeat(q.loss).take(interior.len()));
             points.extend(interior);
         }
 

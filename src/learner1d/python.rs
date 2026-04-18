@@ -1,16 +1,15 @@
 use numpy::{PyArray1, PyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+
 use super::loss::LossFunction;
 use super::{Learner1D, YValue};
 
 /// Extract a `YValue` from a Python object.
-fn extract_yvalue(_py: Python<'_>, obj: &Bound<'_, pyo3::types::PyAny>) -> PyResult<YValue> {
-    // Try float first
+fn extract_yvalue(obj: &Bound<'_, pyo3::types::PyAny>) -> PyResult<YValue> {
     if let Ok(v) = obj.extract::<f64>() {
         return Ok(YValue::Scalar(v));
     }
-    // Try as a sequence / numpy array
     if let Ok(v) = obj.extract::<Vec<f64>>() {
         return Ok(YValue::Vector(v));
     }
@@ -36,7 +35,11 @@ pub struct PyLearner1D {
 impl PyLearner1D {
     #[new]
     #[pyo3(signature = (bounds, loss_per_interval=None))]
-    fn new(py: Python<'_>, bounds: (f64, f64), loss_per_interval: Option<PyObject>) -> PyResult<Self> {
+    fn new(
+        py: Python<'_>,
+        bounds: (f64, f64),
+        loss_per_interval: Option<PyObject>,
+    ) -> PyResult<Self> {
         if bounds.0 >= bounds.1 {
             return Err(PyValueError::new_err(
                 "bounds[0] must be strictly less than bounds[1]",
@@ -44,7 +47,6 @@ impl PyLearner1D {
         }
         let loss_fn = match loss_per_interval {
             Some(obj) => {
-                // Check for known string attributes or just wrap as callback
                 let nn = detect_nth_neighbors(py, &obj);
                 LossFunction::PythonCallback {
                     callback: obj,
@@ -58,9 +60,8 @@ impl PyLearner1D {
         })
     }
 
-    fn tell(&mut self, py: Python<'_>, x: f64, y: &Bound<'_, pyo3::types::PyAny>) -> PyResult<()> {
-        let _ = py;
-        let yv = extract_yvalue(py, y)?;
+    fn tell(&mut self, x: f64, y: &Bound<'_, pyo3::types::PyAny>) -> PyResult<()> {
+        let yv = extract_yvalue(y)?;
         self.inner.tell(x, yv);
         Ok(())
     }
@@ -68,15 +69,13 @@ impl PyLearner1D {
     #[pyo3(signature = (xs, ys, force=false))]
     fn tell_many(
         &mut self,
-        py: Python<'_>,
         xs: Vec<f64>,
         ys: Vec<Bound<'_, pyo3::types::PyAny>>,
         force: bool,
     ) -> PyResult<()> {
-        let _ = py;
         let yvalues: Vec<YValue> = ys
             .iter()
-            .map(|obj| extract_yvalue(py, obj))
+            .map(extract_yvalue)
             .collect::<PyResult<_>>()?;
         self.inner.tell_many(&xs, &yvalues, force);
         Ok(())
@@ -130,13 +129,13 @@ impl PyLearner1D {
                 break;
             }
 
-            // Evaluate in Python
-            let mut yvalues: Vec<YValue> = Vec::with_capacity(xs.len());
-            for &x in &xs {
-                let result = f.call1(py, (x,))?;
-                let yv = extract_yvalue(py, result.bind(py))?;
-                yvalues.push(yv);
-            }
+            let yvalues: Vec<YValue> = xs
+                .iter()
+                .map(|&x| {
+                    let result = f.call1(py, (x,))?;
+                    extract_yvalue(result.bind(py))
+                })
+                .collect::<PyResult<_>>()?;
 
             self.inner.tell_many(&xs, &yvalues, false);
             n_evaluated += xs.len();
@@ -182,23 +181,14 @@ impl PyLearner1D {
             let ys_arr: PyObject = PyArray1::from_vec(py, ys).into_any().unbind();
             Ok((xs_arr, ys_arr))
         } else {
-            let n = data.len();
-            let mut flat = Vec::with_capacity(n * vdim);
-            for (_, y) in &data {
-                match y {
-                    YValue::Vector(v) => flat.extend(v),
-                    YValue::Scalar(v) => flat.push(*v),
-                }
-            }
-            let ys_arr: PyObject = PyArray2::from_vec2(
-                py,
-                &flat
-                    .chunks(vdim)
-                    .map(|c| c.to_vec())
-                    .collect::<Vec<_>>(),
-            )?
-            .into_any()
-            .unbind();
+            let rows: Vec<Vec<f64>> = data
+                .iter()
+                .map(|(_, y)| match y {
+                    YValue::Scalar(v) => vec![*v],
+                    YValue::Vector(v) => v.clone(),
+                })
+                .collect();
+            let ys_arr: PyObject = PyArray2::from_vec2(py, &rows)?.into_any().unbind();
             Ok((xs_arr, ys_arr))
         }
     }
