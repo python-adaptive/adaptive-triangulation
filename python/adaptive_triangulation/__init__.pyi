@@ -17,6 +17,9 @@ from ._rust import (
     circumsphere as circumsphere,
 )
 from ._rust import (
+    default_loss as default_loss,
+)
+from ._rust import (
     fast_2d_circumcircle as fast_2d_circumcircle,
 )
 from ._rust import (
@@ -51,6 +54,7 @@ __all__: list[str] = [
     "VerticesProxy",
     "__version__",
     "circumsphere",
+    "default_loss",
     "fast_2d_circumcircle",
     "fast_2d_point_in_simplex",
     "fast_3d_circumcircle",

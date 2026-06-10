@@ -6,30 +6,38 @@
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
 Fast N-dimensional Delaunay triangulation in Rust with Python bindings (PyO3).
-Drop-in replacement for [adaptive](https://github.com/python-adaptive/adaptive)'s `Triangulation` class — **30-300× faster** standalone, **3.7×** end-to-end in `LearnerND` (where adaptive's own Python code dominates).
+Drop-in replacement for [adaptive](https://github.com/python-adaptive/adaptive)'s `Triangulation` class — **30-300× faster** standalone, **~3.3×** end-to-end in `LearnerND` (where adaptive's own Python code dominates). Used automatically by adaptive ≥ 1.5 when installed.
 
 ## Performance
 
-Measured with the scripts in [`examples/`](examples/), best of 3 for the standalone runs.
+Measured with the scripts in [`examples/`](examples/) against adaptive 1.5.0, best of 3.
 Absolute times are machine-dependent; the ratios are representative.
 
 ### Standalone triangulation (incremental insertion)
 | Case | Rust | Python | Speedup |
 |---|---:|---:|---:|
-| 2D, 1K pts | 18 ms | 731 ms | **40×** |
-| 2D, 5K pts | 134 ms | 14,611 ms | **109×** |
-| 3D, 500 pts | 32 ms | 3,001 ms | **94×** |
-| 3D, 2K pts | 152 ms | 44,262 ms | **291×** |
+| 2D, 1K pts | 18 ms | 730 ms | **41×** |
+| 2D, 5K pts | 138 ms | 14,442 ms | **105×** |
+| 3D, 500 pts | 32 ms | 3,037 ms | **94×** |
+| 3D, 2K pts | 150 ms | 44,531 ms | **297×** |
 
 ### LearnerND integration (end-to-end, `ring_of_fire` 2D)
 | N pts | Learner2D (scipy) | LearnerND (Python) | LearnerND (Rust) |
 |---|---:|---:|---:|
-| 1,000 | 0.23 s | 0.59 s | **0.16 s** |
-| 2,000 | 0.90 s | 1.16 s | **0.32 s** |
-| 5,000 | 5.64 s | 2.95 s | **0.81 s** |
+| 1,000 | 0.23 s | 0.50 s | **0.16 s** |
+| 2,000 | 0.90 s | 1.01 s | **0.32 s** |
+| 5,000 | 5.69 s | 2.57 s | **0.79 s** |
 
-LearnerND + Rust is **3.7× faster** than LearnerND + Python, and **7× faster** than Learner2D at 5K points.
+LearnerND + Rust is **3.3× faster** than LearnerND + Python, and **7× faster** than Learner2D at 5K points.
 The end-to-end ratio is smaller than the standalone one because adaptive's own Python-side loss machinery dominates once the triangulation is fast.
+
+### Batched LearnerND APIs (not yet wired into adaptive)
+
+`simplices_containing` and `default_loss` move two of the remaining `LearnerND`
+Python hot loops into Rust. Wired in the way a future adaptive release would use
+them ([`examples/learnernd_batched_apis.py`](examples/learnernd_batched_apis.py)),
+they add **1.17×** (2D, 3000 pts) to **1.40×** (3D, 1500 pts) on top of the
+table above, while sampling identical points.
 
 ## Installation
 
@@ -59,8 +67,17 @@ print(tri.reference_invariant())  # True
 
 ## Usage with adaptive's LearnerND
 
-This is a drop-in replacement for `adaptive`'s built-in triangulation.
-Monkey-patch the module to use Rust triangulation everywhere:
+Since adaptive 1.5.0 this package is detected and used automatically — no code changes needed:
+
+```bash
+pip install "adaptive[rust]"
+```
+
+Per learner, the backend can be selected explicitly with
+`LearnerND(..., triangulation_backend="auto" | "python" | "rust")`, or globally
+with the `ADAPTIVE_TRIANGULATION_BACKEND` environment variable.
+
+For adaptive < 1.5.0, monkey-patch the module instead:
 
 ```python
 import adaptive_triangulation as at
@@ -92,6 +109,10 @@ tri.circumscribed_circle(simplex)      # → (center, radius)
 tri.volume(simplex)                    # Simplex volume
 tri.volumes()                          # All simplex volumes
 tri.point_in_simplex(point, simplex)   # Containment test
+tri.simplices_containing(point)        # All simplices containing a point, in one call
+                                       # instead of a point_in_simplex loop; pass a known
+                                       # containing simplex via simplex=... to skip the
+                                       # locate step, or restrict with candidates=...
 tri.point_in_circumcircle(pt, simplex) # Circumcircle test
 tri.bowyer_watson(pt_index)            # Direct Bowyer-Watson
 tri.get_opposing_vertices(simplex)     # Facet neighbours' opposite vertices
@@ -111,6 +132,8 @@ from adaptive_triangulation import (
     point_in_simplex,          # Containment test
     volume,                    # Simplex volume
     simplex_volume_in_embedding,  # Volume in embedding space
+    default_loss,              # LearnerND's default loss (embedded simplex volume),
+                               # signature-compatible with loss_per_simplex
     orientation,               # Face orientation
 )
 ```

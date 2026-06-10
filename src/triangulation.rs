@@ -745,6 +745,76 @@ impl Triangulation {
         Ok(geometry::point_in_simplex(point, &vertices, eps)?)
     }
 
+    /// The simplices containing the face that `point` lies on within
+    /// `located` (with `eps` barycentric slack), or `None` when the point
+    /// lies outside `located`. One barycentric solve plus a facet-index
+    /// lookup, instead of a solve per neighbouring simplex.
+    fn containing_via_face(
+        &self,
+        located: &[usize],
+        point: &[f64],
+        eps: f64,
+    ) -> Result<Option<Vec<Simplex>>, TriangulationError> {
+        let alpha = self.barycentric_alpha_for_simplex(located, point)?;
+        let face: Vec<usize> = reduced_simplex_positions(&alpha, eps)
+            .into_iter()
+            .map(|position| located[position])
+            .collect();
+        if face.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.containing(&face)?.into_iter().collect()))
+    }
+
+    /// All simplices that contain `point` with `eps` barycentric slack,
+    /// sorted. With `candidates` this filters them through
+    /// [`Self::point_in_simplex`]; without, it reduces a simplex containing
+    /// the point (the `hint` when it holds the point, else the one
+    /// `locate_point` finds) to the face the point lies on and returns the
+    /// simplices containing that face. One call replaces a caller-side loop
+    /// of `point_in_simplex` checks, which is how adaptive's
+    /// `LearnerND.tell_pending` distributes a point over the simplices it
+    /// touches.
+    pub fn simplices_containing_point(
+        &self,
+        point: &[f64],
+        candidates: Option<Vec<Simplex>>,
+        hint: Option<&[usize]>,
+        eps: f64,
+    ) -> Result<Vec<Simplex>, TriangulationError> {
+        self.validate_point_dim(point)?;
+        let mut containing: Vec<Simplex> = match candidates {
+            Some(candidates) => {
+                let mut containing = Vec::new();
+                for simplex in candidates {
+                    if self.point_in_simplex(point, &simplex, eps)? {
+                        containing.push(simplex);
+                    }
+                }
+                containing
+            }
+            None => {
+                let via_hint = match hint {
+                    Some(hint) if self.contains_simplex(hint) => {
+                        self.containing_via_face(hint, point, eps)?
+                    }
+                    _ => None,
+                };
+                match via_hint {
+                    Some(containing) => containing,
+                    None => match self.locate_point(point)? {
+                        None => Vec::new(),
+                        Some(located) => self
+                            .containing_via_face(&located, point, eps)?
+                            .unwrap_or_default(),
+                    },
+                }
+            }
+        };
+        containing.sort_unstable();
+        Ok(containing)
+    }
+
     /// All `dim`-vertex faces (default: (dim-1)-faces, i.e. facets) of either
     /// the whole triangulation, the given `simplices`, or the simplices
     /// touching the given `vertices` (at most one of the two filters). Faces

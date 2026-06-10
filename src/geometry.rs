@@ -666,6 +666,19 @@ pub fn simplex_volume_in_embedding(vertices: &[Vec<f64>]) -> Result<f64, Geometr
     Ok(vol_square.sqrt())
 }
 
+/// The loss adaptive's `LearnerND` assigns to a simplex by default: the
+/// volume of the simplex embedded in (input + output)-dimensional space,
+/// where each vertex is extended with its function value(s). `simplex` and
+/// `values` are zipped pairwise, like the reference implementation.
+pub fn default_loss(simplex: &[Vec<f64>], values: &[Vec<f64>]) -> Result<f64, GeometryError> {
+    let embedded: Vec<Vec<f64>> = simplex
+        .iter()
+        .zip(values)
+        .map(|(vertex, value)| vertex.iter().chain(value.iter()).copied().collect())
+        .collect();
+    simplex_volume_in_embedding(&embedded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
