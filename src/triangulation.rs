@@ -1,25 +1,38 @@
 //! N-dimensional Delaunay triangulation with incremental Bowyer-Watson
 //! point insertion.
 //!
-//! The module has two layers: the pure-Rust [`Triangulation`] core, which
-//! holds all state and algorithms and never touches Python, and the PyO3
-//! surface ([`PyTriangulation`] plus the proxy/iterator classes) which only
-//! parses arguments, forwards to the core, and converts results and errors.
-//! The Python API deliberately mirrors `adaptive.learner.triangulation`
-//! (including its `point_in_cicumcircle` typo), so adaptive can use either
-//! backend interchangeably.
+//! This is the pure-Rust core: it holds all triangulation state and
+//! algorithms and never touches Python. The PyO3 surface (argument parsing,
+//! result conversion, the proxy views, and the `Triangulation` Python class)
+//! lives in [`crate::py`].
+//!
+//! # Data layout
+//!
+//! Simplices are interned: each lives once in a slab and is referred to
+//! everywhere else by a small integer [`SimplexId`]. Three derived indexes
+//! are kept in sync incrementally by the single pair of mutation primitives
+//! (`link_simplex` / `unlink_simplex`):
+//!
+//! - `ids`: sorted vertex list → id, for membership tests and iteration;
+//! - `vertex_to_ids`: vertex → set of incident simplex ids;
+//! - `facets`: (dim-1)-face → ids of the (normally ≤ 2) simplices sharing
+//!   it, plus the derived `boundary_facets` set (exactly one incident
+//!   simplex, i.e. the convex hull) and `overfull_facets` count (more than
+//!   two incident simplices, i.e. a corrupted triangulation).
+//!
+//! The facet index is what makes the hot paths cheap: walking to a facet
+//! neighbour ([`Triangulation::locate_point`]), cascading through neighbours
+//! in [`Triangulation::bowyer_watson`], and answering
+//! [`Triangulation::containing`] for a facet are all single hash lookups,
+//! and [`Triangulation::extend_hull`] / [`Triangulation::hull`] read the
+//! maintained boundary set instead of recounting every face of every
+//! simplex.
 
 use std::collections::VecDeque;
 use std::sync::{PoisonError, RwLock};
 
-use numpy::PyArray2;
-use pyo3::exceptions::{
-    PyAssertionError, PyIndexError, PyNotImplementedError, PyRuntimeError, PyTypeError,
-    PyValueError, PyZeroDivisionError,
-};
-use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList, PyModule, PySet, PyTuple};
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::geometry::{self, GeometryError};
@@ -32,6 +45,13 @@ use crate::tolerances::{
 pub type PointIndex = usize;
 /// A simplex as a sorted list of vertex indices.
 pub type Simplex = Vec<PointIndex>;
+/// Slab index of an interned simplex; only meaningful while that simplex is
+/// present (ids are recycled after deletion).
+type SimplexId = u32;
+/// The simplices incident to one facet: two for an interior facet, one on
+/// the hull. More than two only in inconsistent states a user can create by
+/// hand through `add_simplex`.
+type IncidentSimplices = SmallVec<[SimplexId; 2]>;
 
 /// Errors from triangulation operations. Each variant maps onto the Python
 /// exception type the reference implementation raises in the same situation.
@@ -54,232 +74,8 @@ pub enum TriangulationError {
     Geometry(#[from] GeometryError),
 }
 
-impl TriangulationError {
-    fn into_pyerr(self) -> PyErr {
-        match self {
-            Self::Value(message) => PyValueError::new_err(message),
-            Self::Index(message) => PyIndexError::new_err(message),
-            Self::Runtime(message) => PyRuntimeError::new_err(message),
-            Self::Assertion(message) => PyAssertionError::new_err(message),
-            Self::Geometry(error) => PyValueError::new_err(error.to_string()),
-        }
-    }
-}
-
-fn index_out_of_range() -> TriangulationError {
+pub(crate) fn index_out_of_range() -> TriangulationError {
     TriangulationError::Index("list index out of range".to_string())
-}
-
-pub(crate) fn parse_point(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
-    let Ok(iter) = obj.try_iter() else {
-        return Err(PyTypeError::new_err("Expected an iterable of floats"));
-    };
-    let mut point = Vec::new();
-    for item in iter {
-        point.push(item?.extract::<f64>()?);
-    }
-    Ok(point)
-}
-
-fn ensure_sized(obj: &Bound<'_, PyAny>, type_error_message: &str) -> PyResult<()> {
-    obj.len()
-        .map(|_| ())
-        .map_err(|_| PyTypeError::new_err(type_error_message.to_string()))
-}
-
-pub(crate) fn parse_points_sized(
-    obj: &Bound<'_, PyAny>,
-    type_error_message: &str,
-) -> PyResult<Vec<Vec<f64>>> {
-    parse_points_impl(obj, type_error_message, true)
-}
-
-fn parse_points_impl(
-    obj: &Bound<'_, PyAny>,
-    type_error_message: &str,
-    require_sized: bool,
-) -> PyResult<Vec<Vec<f64>>> {
-    if require_sized {
-        ensure_sized(obj, type_error_message)?;
-    }
-    let Ok(iter) = obj.try_iter() else {
-        return Err(PyTypeError::new_err(type_error_message.to_string()));
-    };
-
-    let mut points = Vec::new();
-    for item in iter {
-        let item = item?;
-        if require_sized {
-            ensure_sized(&item, type_error_message)?;
-        }
-        let Ok(row_iter) = item.try_iter() else {
-            return Err(PyTypeError::new_err(type_error_message.to_string()));
-        };
-        let mut row = Vec::new();
-        for value in row_iter {
-            row.push(value?.extract::<f64>()?);
-        }
-        points.push(row);
-    }
-    Ok(points)
-}
-
-pub(crate) fn parse_signed_indices(obj: &Bound<'_, PyAny>) -> PyResult<Vec<isize>> {
-    let Ok(iter) = obj.try_iter() else {
-        return Err(PyTypeError::new_err(
-            "Expected an iterable of vertex indices",
-        ));
-    };
-    let mut indices = Vec::new();
-    for item in iter {
-        indices.push(item?.extract::<isize>()?);
-    }
-    Ok(indices)
-}
-
-pub(crate) fn parse_signed_simplex_set(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<isize>>> {
-    let Ok(iter) = obj.try_iter() else {
-        return Err(PyTypeError::new_err("Expected an iterable of simplices"));
-    };
-    let mut simplices = Vec::new();
-    for item in iter {
-        simplices.push(parse_signed_indices(&item?)?);
-    }
-    Ok(simplices)
-}
-
-pub(crate) fn parse_signed_index_set(obj: &Bound<'_, PyAny>) -> PyResult<FxHashSet<isize>> {
-    let Ok(iter) = obj.try_iter() else {
-        return Err(PyTypeError::new_err(
-            "Expected an iterable of vertex indices",
-        ));
-    };
-    let mut indices = FxHashSet::default();
-    for item in iter {
-        indices.insert(item?.extract::<isize>()?);
-    }
-    Ok(indices)
-}
-
-pub(crate) fn parse_optional_transform(
-    obj: Option<&Bound<'_, PyAny>>,
-) -> PyResult<Option<Vec<Vec<f64>>>> {
-    match obj {
-        None => Ok(None),
-        Some(value) if value.is_none() => Ok(None),
-        Some(value) => Ok(Some(parse_points_sized(
-            value,
-            "Expected an N x N transform matrix",
-        )?)),
-    }
-}
-
-pub(crate) fn normalize_index(index: isize, len: usize) -> Result<usize, TriangulationError> {
-    let normalized = if index < 0 {
-        len as isize + index
-    } else {
-        index
-    };
-    if normalized < 0 || normalized >= len as isize {
-        return Err(index_out_of_range());
-    }
-    Ok(normalized as usize)
-}
-
-pub(crate) fn normalize_indices(
-    indices: &[isize],
-    len: usize,
-) -> Result<Vec<usize>, TriangulationError> {
-    indices
-        .iter()
-        .map(|&index| normalize_index(index, len))
-        .collect()
-}
-
-pub(crate) fn canonicalize_simplex(
-    indices: &[isize],
-    len: usize,
-) -> Result<Simplex, TriangulationError> {
-    let mut simplex = normalize_indices(indices, len)?;
-    simplex.sort_unstable();
-    Ok(simplex)
-}
-
-pub(crate) fn normalize_index_set(
-    indices: &FxHashSet<isize>,
-    len: usize,
-) -> Result<FxHashSet<usize>, TriangulationError> {
-    indices
-        .iter()
-        .map(|&index| normalize_index(index, len))
-        .collect()
-}
-
-fn ordered_indices_from_py(obj: &Bound<'_, PyAny>, len: usize) -> PyResult<Vec<usize>> {
-    normalize_indices(&parse_signed_indices(obj)?, len).map_err(TriangulationError::into_pyerr)
-}
-
-fn canonical_simplex_from_py(obj: &Bound<'_, PyAny>, len: usize) -> PyResult<Simplex> {
-    canonicalize_simplex(&parse_signed_indices(obj)?, len).map_err(TriangulationError::into_pyerr)
-}
-
-fn simplex_set_from_py(obj: &Bound<'_, PyAny>, len: usize) -> PyResult<FxHashSet<Simplex>> {
-    let simplices = parse_signed_simplex_set(obj)?;
-    let mut normalized = FxHashSet::default();
-    for simplex in simplices {
-        normalized
-            .insert(normalize_indices(&simplex, len).map_err(TriangulationError::into_pyerr)?);
-    }
-    Ok(normalized)
-}
-
-fn vertex_index_set_from_py(obj: &Bound<'_, PyAny>, len: usize) -> PyResult<FxHashSet<usize>> {
-    normalize_index_set(&parse_signed_index_set(obj)?, len).map_err(TriangulationError::into_pyerr)
-}
-
-pub(crate) fn point_tuple(py: Python<'_>, point: &[f64]) -> Py<PyTuple> {
-    PyTuple::new(py, point.iter().copied()).unwrap().into()
-}
-
-pub(crate) fn simplex_tuple(py: Python<'_>, simplex: &[usize]) -> Py<PyTuple> {
-    PyTuple::new(py, simplex.iter().copied()).unwrap().into()
-}
-
-pub(crate) fn simplex_set_py(
-    py: Python<'_>,
-    simplices: &FxHashSet<Simplex>,
-) -> PyResult<Py<PyAny>> {
-    let tuples: Vec<Py<PyAny>> = simplices
-        .iter()
-        .map(|simplex| simplex_tuple(py, simplex).into())
-        .collect();
-    Ok(PySet::new(py, &tuples)?.into())
-}
-
-pub(crate) fn point_list_py(py: Python<'_>, points: &[Vec<f64>]) -> PyResult<Py<PyAny>> {
-    let tuples: Vec<Py<PyAny>> = points
-        .iter()
-        .map(|point| point_tuple(py, point).into())
-        .collect();
-    Ok(PyList::new(py, tuples)?.into())
-}
-
-pub(crate) fn index_list_py(py: Python<'_>, indices: &[usize]) -> PyResult<Py<PyAny>> {
-    Ok(PyList::new(py, indices.iter().copied())?.into())
-}
-
-pub(crate) fn signed_index_list_py(py: Python<'_>, indices: &[isize]) -> PyResult<Py<PyAny>> {
-    Ok(PyList::new(py, indices.iter().copied())?.into())
-}
-
-fn identity_transform(dim: usize) -> Vec<Vec<f64>> {
-    (0..dim)
-        .map(|row| {
-            (0..dim)
-                .map(|col| if row == col { 1.0 } else { 0.0 })
-                .collect()
-        })
-        .collect()
 }
 
 fn validate_transform(
@@ -310,26 +106,12 @@ fn apply_transform(point: &[f64], transform: &[Vec<f64>]) -> Vec<f64> {
     result
 }
 
-/// Raise `numpy.linalg.LinAlgError` (falling back to `ValueError` when numpy
-/// is unavailable), matching where the reference implementation lets numpy
-/// solves fail.
-pub(crate) fn numpy_linalg_error(py: Python<'_>, message: &str) -> PyErr {
-    PyModule::import(py, "numpy.linalg")
-        .and_then(|module| {
-            let error_type = module.getattr("LinAlgError")?;
-            let args = PyTuple::new(py, [message]).unwrap();
-            let value = error_type.call1(args)?;
-            Ok(PyErr::from_value(value))
-        })
-        .unwrap_or_else(|_| PyValueError::new_err(message.to_string()))
-}
-
 /// Positions (`0..=dim`) of the simplex vertices kept after reducing against
 /// the barycentric coordinates `alpha` (relative to vertex 0): vertices whose
 /// coordinate exceeds `eps` survive, and an empty result means the point lies
 /// outside the simplex. A single surviving position means the point coincides
 /// with that vertex.
-fn reduced_simplex_positions(alpha: &[f64], eps: f64) -> Vec<usize> {
+pub(crate) fn reduced_simplex_positions(alpha: &[f64], eps: f64) -> Vec<usize> {
     let sum_alpha = alpha.iter().sum::<f64>();
     if alpha.iter().any(|value| *value < -eps) || sum_alpha > 1.0 + eps {
         return Vec::new();
@@ -367,35 +149,13 @@ fn combinations(
     }
 }
 
-fn scipy_delaunay_simplices(
-    py: Python<'_>,
-    coords: &[Vec<f64>],
-    dim: usize,
-) -> PyResult<Option<Vec<Simplex>>> {
-    if dim == 1 {
-        return Ok(None);
-    }
-
-    let Ok(spatial) = PyModule::import(py, "scipy.spatial") else {
-        return Ok(None);
-    };
-    let coords_array = PyArray2::from_vec2(py, coords)?;
-    let Ok(delaunay) = spatial.getattr("Delaunay")?.call1((coords_array,)) else {
-        return Ok(None);
-    };
-
-    let simplices = delaunay.getattr("simplices")?;
-    let mut initial = Vec::new();
-    for simplex in simplices.try_iter()? {
-        let simplex = simplex?;
-        let mut indices = Vec::new();
-        for item in simplex.try_iter()? {
-            indices.push(item?.extract::<usize>()?);
-        }
-        indices.sort_unstable();
-        initial.push(indices);
-    }
-    Ok(Some(initial))
+/// The facet of a sorted `simplex` obtained by removing the vertex at
+/// position `skip`; the result is still sorted.
+fn facet_excluding(simplex: &[usize], skip: usize) -> Simplex {
+    let mut facet = Vec::with_capacity(simplex.len() - 1);
+    facet.extend_from_slice(&simplex[..skip]);
+    facet.extend_from_slice(&simplex[skip + 1..]);
+    facet
 }
 
 fn is_close(a: f64, b: f64) -> bool {
@@ -405,34 +165,65 @@ fn is_close(a: f64, b: f64) -> bool {
     (a - b).abs() <= VOLUME_CONSERVATION_ATOL + VOLUME_CONSERVATION_RTOL * scale
 }
 
+/// Result of one step of the simplex walk in [`Triangulation::locate_point`].
+enum WalkStep {
+    /// The current simplex contains the point.
+    Inside,
+    /// The point lies beyond this facet neighbour; continue walking there.
+    Neighbour(SimplexId),
+    /// The point lies beyond a hull facet, i.e. outside the triangulation.
+    OutsideHull,
+}
+
 /// An N-dimensional Delaunay triangulation supporting incremental point
 /// insertion via the Bowyer-Watson algorithm. Pure Rust; the Python surface
-/// lives on [`PyTriangulation`].
+/// lives on [`crate::py::PyTriangulation`]. See the module docs for the
+/// data layout.
 #[derive(Debug)]
 pub struct Triangulation {
     /// Vertex coordinates, indexed by [`PointIndex`]. Vertices are never
     /// removed; a vertex may belong to no simplex (e.g. rejected duplicates).
     pub vertices: Vec<Vec<f64>>,
-    /// All current simplices, each sorted ascending.
-    pub simplices: FxHashSet<Simplex>,
-    /// For each vertex, the simplices it belongs to (inverse of
-    /// [`Self::simplices`]; see [`Self::reference_invariant`]).
-    pub vertex_to_simplices: Vec<FxHashSet<Simplex>>,
     /// Dimensionality of the vertex coordinates.
     pub dim: usize,
+    /// Interned simplex storage; `None` entries are free slots whose ids sit
+    /// in [`Self::free_ids`] awaiting reuse.
+    slab: Vec<Option<Simplex>>,
+    /// Recycled slab indices.
+    free_ids: Vec<SimplexId>,
+    /// Sorted vertex list → slab id, for membership tests and iteration.
+    ids: FxHashMap<Simplex, SimplexId>,
+    /// For each vertex, the ids of the simplices it belongs to.
+    vertex_to_ids: Vec<FxHashSet<SimplexId>>,
+    /// Every (dim-1)-face of a current simplex → ids of the simplices that
+    /// share it.
+    facets: FxHashMap<Simplex, IncidentSimplices>,
+    /// Facets with exactly one incident simplex, i.e. the convex hull.
+    boundary_facets: FxHashSet<Simplex>,
+    /// Number of facets with more than two incident simplices. Non-zero only
+    /// when hand-built simplices made the triangulation inconsistent;
+    /// [`Self::hull`] reports that as an error.
+    overfull_facets: usize,
     // Cache of the simplex found by the last point location, used as the
-    // start of the next walk. Interior-mutable so lookups stay `&self`.
-    last_simplex: RwLock<Option<Simplex>>,
+    // start of the next walk. A recycled id is harmless here: it then names
+    // some other live simplex, which is an equally valid walk start.
+    // Interior-mutable so lookups stay `&self`.
+    last_simplex: RwLock<Option<SimplexId>>,
 }
 
 impl Clone for Triangulation {
     fn clone(&self) -> Self {
         Self {
             vertices: self.vertices.clone(),
-            simplices: self.simplices.clone(),
-            vertex_to_simplices: self.vertex_to_simplices.clone(),
             dim: self.dim,
-            last_simplex: RwLock::new(self.last_simplex().clone()),
+            slab: self.slab.clone(),
+            free_ids: self.free_ids.clone(),
+            ids: self.ids.clone(),
+            vertex_to_ids: self.vertex_to_ids.clone(),
+            facets: self.facets.clone(),
+            boundary_facets: self.boundary_facets.clone(),
+            overfull_facets: self.overfull_facets,
+            last_simplex: RwLock::new(*self.last_simplex()),
         }
     }
 }
@@ -441,20 +232,125 @@ impl Triangulation {
     // The location cache is only ever replaced wholesale, so a poisoned lock
     // (a panic while it was held) cannot leave it inconsistent; recover the
     // value rather than propagating the panic across the FFI boundary.
-    fn last_simplex(&self) -> std::sync::RwLockReadGuard<'_, Option<Simplex>> {
+    fn last_simplex(&self) -> std::sync::RwLockReadGuard<'_, Option<SimplexId>> {
         self.last_simplex
             .read()
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn set_last_simplex(&self, simplex: Option<Simplex>) {
+    fn set_last_simplex(&self, id: Option<SimplexId>) {
         *self
             .last_simplex
             .write()
-            .unwrap_or_else(PoisonError::into_inner) = simplex;
+            .unwrap_or_else(PoisonError::into_inner) = id;
     }
 
-    fn validate_coords(coords: &[Vec<f64>]) -> Result<usize, TriangulationError> {
+    fn empty(vertices: Vec<Vec<f64>>, dim: usize) -> Self {
+        Self {
+            vertex_to_ids: vec![FxHashSet::default(); vertices.len()],
+            vertices,
+            dim,
+            slab: Vec::new(),
+            free_ids: Vec::new(),
+            ids: FxHashMap::default(),
+            facets: FxHashMap::default(),
+            boundary_facets: FxHashSet::default(),
+            overfull_facets: 0,
+            last_simplex: RwLock::new(None),
+        }
+    }
+
+    /// The interned simplex for a live id.
+    fn simplex_by_id(&self, id: SimplexId) -> &Simplex {
+        self.slab[id as usize]
+            .as_ref()
+            .expect("simplex id points at a freed slab slot")
+    }
+
+    /// Whether `id` currently names a live simplex.
+    fn id_is_live(&self, id: SimplexId) -> bool {
+        self.slab
+            .get(id as usize)
+            .is_some_and(|slot| slot.is_some())
+    }
+
+    /// Intern `simplex` (which must already be sorted) and update every
+    /// derived index. Returns `false` (and changes nothing) when it is
+    /// already present.
+    fn link_simplex(&mut self, simplex: Simplex) -> bool {
+        if self.ids.contains_key(&simplex) {
+            return false;
+        }
+        let id = if let Some(id) = self.free_ids.pop() {
+            self.slab[id as usize] = Some(simplex.clone());
+            id
+        } else {
+            self.slab.push(Some(simplex.clone()));
+            SimplexId::try_from(self.slab.len() - 1).expect("more than u32::MAX simplices")
+        };
+
+        for &vertex in &simplex {
+            self.vertex_to_ids[vertex].insert(id);
+        }
+        for skip in 0..simplex.len() {
+            let facet = facet_excluding(&simplex, skip);
+            if let Some(incident) = self.facets.get_mut(&facet) {
+                incident.push(id);
+                match incident.len() {
+                    2 => {
+                        self.boundary_facets.remove(&facet);
+                    }
+                    3 => self.overfull_facets += 1,
+                    _ => {}
+                }
+            } else {
+                self.facets
+                    .insert(facet.clone(), SmallVec::from_slice(&[id]));
+                self.boundary_facets.insert(facet);
+            }
+        }
+        self.ids.insert(simplex, id);
+        true
+    }
+
+    /// Remove the interned `simplex` (which must already be sorted) and
+    /// update every derived index. Returns `false` when it is not present.
+    fn unlink_simplex(&mut self, simplex: &[usize]) -> bool {
+        let Some(id) = self.ids.remove(simplex) else {
+            return false;
+        };
+        self.slab[id as usize] = None;
+        self.free_ids.push(id);
+
+        for &vertex in simplex {
+            self.vertex_to_ids[vertex].remove(&id);
+        }
+        for skip in 0..simplex.len() {
+            let facet = facet_excluding(simplex, skip);
+            let remaining = {
+                let incident = self
+                    .facets
+                    .get_mut(&facet)
+                    .expect("facet index out of sync with simplex storage");
+                incident.retain(|&mut other| other != id);
+                incident.len()
+            };
+            match remaining {
+                0 => {
+                    self.facets.remove(&facet);
+                    self.boundary_facets.remove(&facet);
+                }
+                1 => {
+                    self.boundary_facets.insert(facet);
+                }
+                2 => self.overfull_facets -= 1,
+                _ => {}
+            }
+        }
+        true
+    }
+
+    pub(crate) fn validate_coords(coords: &[Vec<f64>]) -> Result<usize, TriangulationError> {
         if coords.is_empty() {
             return Err(TriangulationError::Value(
                 "Please provide at least one simplex".to_string(),
@@ -485,7 +381,7 @@ impl Triangulation {
         Ok(dim)
     }
 
-    fn validate_point_dim(&self, point: &[f64]) -> Result<(), TriangulationError> {
+    pub(crate) fn validate_point_dim(&self, point: &[f64]) -> Result<(), TriangulationError> {
         if point.len() != self.dim {
             return Err(TriangulationError::Value(
                 "Coordinates dimension mismatch".to_string(),
@@ -537,13 +433,7 @@ impl Triangulation {
         simplices: impl IntoIterator<Item = Simplex>,
     ) -> Result<Self, TriangulationError> {
         let dim = Self::validate_coords(&coords)?;
-        let mut triangulation = Self {
-            vertex_to_simplices: vec![FxHashSet::default(); coords.len()],
-            vertices: coords,
-            simplices: FxHashSet::default(),
-            dim,
-            last_simplex: RwLock::new(None),
-        };
+        let mut triangulation = Self::empty(coords, dim);
         for simplex in simplices {
             triangulation.add_simplex(simplex)?;
         }
@@ -589,13 +479,7 @@ impl Triangulation {
         let seed_simplex = Self::find_seed_simplex(&coords, dim)?;
         let seed_vertices: FxHashSet<usize> = seed_simplex.iter().copied().collect();
 
-        let mut triangulation = Self {
-            vertex_to_simplices: vec![FxHashSet::default(); coords.len()],
-            vertices: coords,
-            simplices: FxHashSet::default(),
-            dim,
-            last_simplex: RwLock::new(None),
-        };
+        let mut triangulation = Self::empty(coords, dim);
         triangulation.add_simplex(seed_simplex)?;
 
         for pt_index in 0..triangulation.vertices.len() {
@@ -629,8 +513,59 @@ impl Triangulation {
         Ok(triangulation)
     }
 
-    /// Insert a simplex (sorted automatically), keeping
-    /// [`Self::vertex_to_simplices`] in sync. No geometric checks are done.
+    /// Number of simplices currently in the triangulation.
+    pub fn num_simplices(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Iterator over all current simplices (each sorted ascending), in
+    /// arbitrary order.
+    pub fn simplices(&self) -> impl Iterator<Item = &Simplex> + '_ {
+        self.ids.keys()
+    }
+
+    /// Whether the already-sorted `simplex` is present. See
+    /// [`Self::has_simplex`] for the order-insensitive, validating variant.
+    pub fn contains_simplex(&self, simplex: &[usize]) -> bool {
+        self.ids.contains_key(simplex)
+    }
+
+    /// Append a vertex without connecting it to any simplex. Used while
+    /// inserting points; a vertex that ends up unconnected (e.g. a rejected
+    /// duplicate) must be rolled back by the caller.
+    pub fn add_vertex(&mut self, point: Vec<f64>) -> PointIndex {
+        self.vertices.push(point);
+        self.vertex_to_ids.push(FxHashSet::default());
+        self.vertices.len() - 1
+    }
+
+    fn pop_vertex(&mut self) {
+        self.vertices.pop();
+        self.vertex_to_ids.pop();
+    }
+
+    /// Number of simplices the given vertex belongs to.
+    pub fn vertex_simplex_count(&self, vertex: PointIndex) -> usize {
+        self.vertex_to_ids[vertex].len()
+    }
+
+    /// Iterator over the simplices containing `vertex`, in arbitrary order.
+    /// The index must be valid.
+    pub fn simplices_of(&self, vertex: PointIndex) -> impl Iterator<Item = &Simplex> + '_ {
+        self.vertex_to_ids[vertex]
+            .iter()
+            .map(|&id| self.simplex_by_id(id))
+    }
+
+    /// Whether the already-sorted `simplex` is present and contains `vertex`.
+    pub fn vertex_has_simplex(&self, vertex: PointIndex, simplex: &[usize]) -> bool {
+        self.ids
+            .get(simplex)
+            .is_some_and(|id| self.vertex_to_ids[vertex].contains(id))
+    }
+
+    /// Insert a simplex (sorted automatically), keeping all derived indexes
+    /// in sync. No geometric checks are done.
     pub fn add_simplex(&mut self, mut simplex: Simplex) -> Result<(), TriangulationError> {
         simplex.sort_unstable();
         if simplex.len() != self.dim + 1 {
@@ -640,23 +575,16 @@ impl Triangulation {
             )));
         }
         self.validate_simplex_indices(&simplex)?;
-        if self.simplices.insert(simplex.clone()) {
-            for &vertex in &simplex {
-                self.vertex_to_simplices[vertex].insert(simplex.clone());
-            }
-        }
+        self.link_simplex(simplex);
         Ok(())
     }
 
-    /// Remove a simplex, keeping [`Self::vertex_to_simplices`] in sync.
+    /// Remove a simplex, keeping all derived indexes in sync.
     pub fn delete_simplex(&mut self, simplex: &[usize]) -> Result<(), TriangulationError> {
         let mut simplex = simplex.to_vec();
         simplex.sort_unstable();
-        if !self.simplices.remove(&simplex) {
+        if !self.unlink_simplex(&simplex) {
             return Err(TriangulationError::Value("Simplex not present".to_string()));
-        }
-        for &vertex in &simplex {
-            self.vertex_to_simplices[vertex].remove(&simplex);
         }
         Ok(())
     }
@@ -674,10 +602,10 @@ impl Triangulation {
     }
 
     fn locate_point_scan(&self, point: &[f64]) -> Result<Option<Simplex>, TriangulationError> {
-        for simplex in &self.simplices {
+        for (simplex, &id) in &self.ids {
             let vertices = self.get_vertices(simplex)?;
             if geometry::point_in_simplex(point, &vertices, BARYCENTRIC_EPS)? {
-                self.set_last_simplex(Some(simplex.clone()));
+                self.set_last_simplex(Some(id));
                 return Ok(Some(simplex.clone()));
             }
         }
@@ -686,7 +614,7 @@ impl Triangulation {
 
     /// Barycentric coordinates of `point` relative to vertices `1..=dim` of
     /// `simplex`, without cloning the vertex coordinates.
-    fn barycentric_alpha_for_simplex(
+    pub(crate) fn barycentric_alpha_for_simplex(
         &self,
         simplex: &[usize],
         point: &[f64],
@@ -700,9 +628,10 @@ impl Triangulation {
 
     fn next_simplex_in_walk(
         &self,
-        simplex: &[usize],
+        id: SimplexId,
         point: &[f64],
-    ) -> Result<Option<Simplex>, TriangulationError> {
+    ) -> Result<WalkStep, TriangulationError> {
+        let simplex = self.simplex_by_id(id);
         let alpha = self.barycentric_alpha_for_simplex(simplex, point)?;
         let alpha0 = 1.0 - alpha.iter().sum::<f64>();
 
@@ -716,20 +645,18 @@ impl Triangulation {
         }
 
         if worst_value >= -BARYCENTRIC_EPS {
-            self.set_last_simplex(Some(simplex.to_vec()));
-            return Ok(Some(simplex.to_vec()));
+            return Ok(WalkStep::Inside);
         }
 
-        let mut face = Vec::with_capacity(self.dim);
-        for (idx, &vertex) in simplex.iter().enumerate() {
-            if idx != worst_idx {
-                face.push(vertex);
-            }
-        }
-
-        let mut neighbours = self.containing(&face)?;
-        neighbours.remove(simplex);
-        Ok(neighbours.into_iter().next())
+        let face = facet_excluding(simplex, worst_idx);
+        let neighbour = self
+            .facets
+            .get(&face)
+            .and_then(|incident| incident.iter().copied().find(|&other| other != id));
+        Ok(match neighbour {
+            Some(next) => WalkStep::Neighbour(next),
+            None => WalkStep::OutsideHull,
+        })
     }
 
     /// Find a simplex containing `point` by walking from the last located
@@ -737,21 +664,23 @@ impl Triangulation {
     /// solve. Returns `None` when the point is outside the hull.
     pub fn locate_point(&self, point: &[f64]) -> Result<Option<Simplex>, TriangulationError> {
         self.validate_point_dim(point)?;
-        let Some(mut current) = self
+        let start = self
             .last_simplex()
-            .clone()
-            .filter(|simplex| self.simplices.contains(simplex))
-            .or_else(|| self.simplices.iter().next().cloned())
-        else {
+            .filter(|&id| self.id_is_live(id))
+            .or_else(|| self.ids.values().next().copied());
+        let Some(mut current) = start else {
             return Ok(None);
         };
 
         let mut visited = FxHashSet::default();
-        while visited.insert(current.clone()) {
-            match self.next_simplex_in_walk(&current, point) {
-                Ok(Some(next)) if next == current => return Ok(Some(current)),
-                Ok(Some(next)) => current = next,
-                Ok(None) => return Ok(None),
+        while visited.insert(current) {
+            match self.next_simplex_in_walk(current, point) {
+                Ok(WalkStep::Inside) => {
+                    self.set_last_simplex(Some(current));
+                    return Ok(Some(self.simplex_by_id(current).clone()));
+                }
+                Ok(WalkStep::Neighbour(next)) => current = next,
+                Ok(WalkStep::OutsideHull) => return Ok(None),
                 Err(TriangulationError::Geometry(GeometryError::SingularMatrix)) => break,
                 Err(err) => return Err(err),
             }
@@ -818,26 +747,29 @@ impl Triangulation {
         }
 
         let face_size = dim.unwrap_or(self.dim);
-        let simplex_pool: Vec<Simplex> = if let Some(vertices) = vertices {
-            let mut pool = FxHashSet::default();
+        let simplex_pool: Vec<&Simplex> = if let Some(vertices) = vertices {
+            let mut pool_ids = FxHashSet::default();
             for &vertex in vertices {
                 self.validate_vertex_index(vertex)?;
-                pool.extend(self.vertex_to_simplices[vertex].iter().cloned());
+                pool_ids.extend(self.vertex_to_ids[vertex].iter().copied());
             }
-            pool.into_iter().collect()
+            pool_ids
+                .into_iter()
+                .map(|id| self.simplex_by_id(id))
+                .collect()
         } else if let Some(simplices) = simplices {
             for simplex in simplices {
                 self.validate_simplex_indices(simplex)?;
             }
-            simplices.iter().cloned().collect()
+            simplices.iter().collect()
         } else {
-            self.simplices.iter().cloned().collect()
+            self.ids.keys().collect()
         };
 
         let mut faces = Vec::new();
         for simplex in simplex_pool {
             let mut current = Vec::new();
-            combinations(&simplex, face_size, &mut faces, &mut current, 0);
+            combinations(simplex, face_size, &mut faces, &mut current, 0);
         }
 
         if let Some(vertices) = vertices {
@@ -850,41 +782,44 @@ impl Triangulation {
         }
     }
 
-    /// Count, for every (dim-1)-face of the given simplex pool (or of the
-    /// whole triangulation when `None`), how many simplices it belongs to.
-    /// In a consistent triangulation a count of 1 means a boundary face and
-    /// 2 an interior face.
-    fn face_multiplicities(
-        &self,
-        simplices: Option<&FxHashSet<Simplex>>,
-    ) -> Result<FxHashMap<Simplex, usize>, TriangulationError> {
-        let faces = self.faces(None, simplices, None)?;
-        let mut multiplicities: FxHashMap<Simplex, usize> = FxHashMap::default();
-        for face in faces {
-            *multiplicities.entry(face).or_insert(0) += 1;
-        }
-        Ok(multiplicities)
-    }
-
     /// All simplices that contain every vertex of `face`.
     pub fn containing(&self, face: &[usize]) -> Result<FxHashSet<Simplex>, TriangulationError> {
         if face.is_empty() {
             return Ok(FxHashSet::default());
         }
         self.validate_simplex_indices(face)?;
-        let mut face_vertices = face.iter().copied();
-        let first_vertex = face_vertices
-            .by_ref()
-            .min_by_key(|vertex| self.vertex_to_simplices[*vertex].len())
-            .unwrap();
-        let mut result = self.vertex_to_simplices[first_vertex].clone();
-        for &vertex in face {
-            if vertex == first_vertex {
-                continue;
-            }
-            result.retain(|simplex| self.vertex_to_simplices[vertex].contains(simplex));
+
+        // A facet-sized face is a single lookup in the facet index.
+        if face.len() == self.dim {
+            let mut sorted = face.to_vec();
+            sorted.sort_unstable();
+            return Ok(self
+                .facets
+                .get(&sorted)
+                .map(|incident| {
+                    incident
+                        .iter()
+                        .map(|&id| self.simplex_by_id(id).clone())
+                        .collect()
+                })
+                .unwrap_or_default());
         }
-        Ok(result)
+
+        let first_vertex = face
+            .iter()
+            .copied()
+            .min_by_key(|&vertex| self.vertex_to_ids[vertex].len())
+            .unwrap();
+        Ok(self.vertex_to_ids[first_vertex]
+            .iter()
+            .copied()
+            .filter(|&id| {
+                face.iter().all(|&vertex| {
+                    vertex == first_vertex || self.vertex_to_ids[vertex].contains(&id)
+                })
+            })
+            .map(|id| self.simplex_by_id(id).clone())
+            .collect())
     }
 
     fn simplex_points(
@@ -964,6 +899,23 @@ impl Triangulation {
         self.point_in_circumcircle_impl(&self.vertices[pt_index], simplex, transform.as_deref())
     }
 
+    /// Count, for every facet of the given simplices, how many of them it
+    /// belongs to. Within a Bowyer-Watson cavity a count of 1 means a face
+    /// of the hole being re-triangulated.
+    fn facet_multiplicities<'a>(
+        simplices: impl Iterator<Item = &'a Simplex>,
+    ) -> FxHashMap<Simplex, usize> {
+        let mut multiplicities: FxHashMap<Simplex, usize> = FxHashMap::default();
+        for simplex in simplices {
+            for skip in 0..simplex.len() {
+                *multiplicities
+                    .entry(facet_excluding(simplex, skip))
+                    .or_insert(0) += 1;
+            }
+        }
+        multiplicities
+    }
+
     /// Re-triangulate around vertex `pt_index`: delete every simplex whose
     /// circumsphere contains it (cascading through facet neighbours, except
     /// in 1D) and fill the resulting hole with simplices through the vertex.
@@ -985,28 +937,27 @@ impl Triangulation {
         // Collect the cavity (every simplex whose circumsphere contains the
         // point, cascading through facet neighbours) without mutating, so
         // that pathological insertions can still be rejected cleanly below.
-        let mut queue = VecDeque::new();
-        let mut queued = FxHashSet::default();
-        let mut bad_triangles: FxHashSet<Simplex> = FxHashSet::default();
+        let mut queue: VecDeque<SimplexId> = VecDeque::new();
+        let mut queued: FxHashSet<SimplexId> = FxHashSet::default();
+        let mut bad_ids: FxHashSet<SimplexId> = FxHashSet::default();
 
         if let Some(simplex) = containing_simplex {
-            queued.insert(simplex.clone());
-            queue.push_back(simplex);
+            if let Some(&id) = self.ids.get(&simplex) {
+                queued.insert(id);
+                queue.push_back(id);
+            }
         } else {
-            for simplex in self.vertex_to_simplices[pt_index].iter().cloned() {
-                if queued.insert(simplex.clone()) {
-                    queue.push_back(simplex);
+            for &id in &self.vertex_to_ids[pt_index] {
+                if queued.insert(id) {
+                    queue.push_back(id);
                 }
             }
         }
 
-        while let Some(simplex) = queue.pop_front() {
-            if !self.simplices.contains(&simplex) {
-                continue;
-            }
-
-            if self.point_in_circumcircle(pt_index, &simplex, transform)? {
-                bad_triangles.insert(simplex.clone());
+        while let Some(id) = queue.pop_front() {
+            let simplex = self.simplex_by_id(id);
+            if self.point_in_circumcircle(pt_index, simplex, transform)? {
+                bad_ids.insert(id);
 
                 if self.dim == 1 {
                     // Inserting a point into an interval never invalidates
@@ -1014,26 +965,27 @@ impl Triangulation {
                     continue;
                 }
 
-                let simplex_vertices: FxHashSet<usize> = simplex.iter().copied().collect();
-                let mut neighbours = FxHashSet::default();
-                for &vertex in &simplex {
-                    neighbours.extend(self.vertex_to_simplices[vertex].iter().cloned());
-                }
-
-                for neighbour in neighbours {
-                    let shared = neighbour
-                        .iter()
-                        .filter(|vertex| simplex_vertices.contains(vertex))
-                        .count();
-                    if shared == self.dim && queued.insert(neighbour.clone()) {
-                        queue.push_back(neighbour);
+                let simplex = self.simplex_by_id(id);
+                for skip in 0..simplex.len() {
+                    let facet = facet_excluding(simplex, skip);
+                    let Some(incident) = self.facets.get(&facet) else {
+                        continue;
+                    };
+                    for &neighbour in incident {
+                        if neighbour != id && queued.insert(neighbour) {
+                            queue.push_back(neighbour);
+                        }
                     }
                 }
             }
         }
 
-        let hole_faces: Vec<Simplex> = self
-            .face_multiplicities(Some(&bad_triangles))?
+        let bad_simplices: Vec<Simplex> = bad_ids
+            .iter()
+            .map(|&id| self.simplex_by_id(id).clone())
+            .collect();
+
+        let hole_faces: Vec<Simplex> = Self::facet_multiplicities(bad_simplices.iter())
             .into_iter()
             .filter_map(|(face, count)| (count == 1).then_some(face))
             .collect();
@@ -1059,13 +1011,13 @@ impl Triangulation {
         // simplex around it). Reject the insertion before mutating anything
         // rather than orphaning the vertex and corrupting the triangulation.
         let candidate_vertices: FxHashSet<usize> = candidates.iter().flatten().copied().collect();
-        for &vertex in bad_triangles.iter().flatten() {
+        for &vertex in bad_simplices.iter().flatten() {
             if vertex == pt_index || candidate_vertices.contains(&vertex) {
                 continue;
             }
-            if self.vertex_to_simplices[vertex]
+            if self.vertex_to_ids[vertex]
                 .iter()
-                .all(|simplex| bad_triangles.contains(simplex))
+                .all(|id| bad_ids.contains(id))
             {
                 return Err(TriangulationError::Value(
                     "Point already in triangulation.".to_string(),
@@ -1073,14 +1025,18 @@ impl Triangulation {
             }
         }
 
-        for simplex in &bad_triangles {
+        for simplex in &bad_simplices {
             self.delete_simplex(simplex)?;
         }
         for simplex in candidates {
             self.add_simplex(simplex)?;
         }
 
-        let new_triangles = self.vertex_to_simplices[pt_index].clone();
+        let new_triangles: FxHashSet<Simplex> = self.vertex_to_ids[pt_index]
+            .iter()
+            .map(|&id| self.simplex_by_id(id).clone())
+            .collect();
+        let bad_triangles: FxHashSet<Simplex> = bad_simplices.into_iter().collect();
         let deleted_simplices: FxHashSet<Simplex> =
             bad_triangles.difference(&new_triangles).cloned().collect();
         let new_simplices: FxHashSet<Simplex> =
@@ -1109,11 +1065,9 @@ impl Triangulation {
         pt_index: usize,
     ) -> Result<FxHashSet<Simplex>, TriangulationError> {
         self.validate_vertex_index(pt_index)?;
-        let hull_faces: Vec<Simplex> = self
-            .face_multiplicities(None)?
-            .into_iter()
-            .filter_map(|(face, count)| (count == 1).then_some(face))
-            .collect();
+        // Snapshot the hull before mutating: the boundary set changes as new
+        // simplices attach to it.
+        let hull_faces: Vec<Simplex> = self.boundary_facets.iter().cloned().collect();
 
         let hull_points: Vec<Vec<f64>> = hull_faces
             .iter()
@@ -1149,7 +1103,10 @@ impl Triangulation {
         }
 
         if new_simplices.is_empty() {
-            let attached = self.vertex_to_simplices[pt_index].clone();
+            let attached: Vec<Simplex> = self.vertex_to_ids[pt_index]
+                .iter()
+                .map(|&id| self.simplex_by_id(id).clone())
+                .collect();
             for simplex in attached {
                 self.delete_simplex(&simplex)?;
             }
@@ -1179,16 +1136,13 @@ impl Triangulation {
             None => self.locate_point(&point)?.unwrap_or_default(),
         };
         let actual_simplex = simplex.clone();
-        self.vertex_to_simplices.push(FxHashSet::default());
 
         if simplex.is_empty() {
-            self.vertices.push(point);
-            let pt_index = self.vertices.len() - 1;
+            let pt_index = self.add_vertex(point);
             let temporary_simplices = match self.extend_hull(pt_index) {
                 Ok(simplices) => simplices,
                 Err(err) => {
-                    self.vertex_to_simplices.pop();
-                    self.vertices.pop();
+                    self.pop_vertex();
                     return Err(err);
                 }
             };
@@ -1198,11 +1152,14 @@ impl Triangulation {
                     // Value errors are raised before bowyer_watson mutates,
                     // so only the hull extension needs rolling back.
                     Err(err @ TriangulationError::Value(_)) => {
-                        for simplex in self.vertex_to_simplices[pt_index].clone() {
+                        let attached: Vec<Simplex> = self.vertex_to_ids[pt_index]
+                            .iter()
+                            .map(|&id| self.simplex_by_id(id).clone())
+                            .collect();
+                        for simplex in attached {
                             self.delete_simplex(&simplex)?;
                         }
-                        self.vertex_to_simplices.pop();
-                        self.vertices.pop();
+                        self.pop_vertex();
                         return Err(err);
                     }
                     Err(err) => return Err(err),
@@ -1221,7 +1178,6 @@ impl Triangulation {
 
         let reduced_simplex = self.get_reduced_simplex(&point, &simplex, BARYCENTRIC_EPS)?;
         if reduced_simplex.is_empty() {
-            self.vertex_to_simplices.pop();
             return Err(TriangulationError::Value(
                 "Point lies outside of the specified simplex.".to_string(),
             ));
@@ -1229,20 +1185,17 @@ impl Triangulation {
         simplex = reduced_simplex;
 
         if simplex.len() == 1 {
-            self.vertex_to_simplices.pop();
             return Err(TriangulationError::Value(
                 "Point already in triangulation.".to_string(),
             ));
         }
 
-        let pt_index = self.vertices.len();
-        self.vertices.push(point);
+        let pt_index = self.add_vertex(point);
         match self.bowyer_watson(pt_index, Some(actual_simplex), &transform) {
             // Value errors are raised before bowyer_watson mutates, so only
             // the freshly pushed vertex needs rolling back.
             Err(err @ TriangulationError::Value(_)) => {
-                self.vertex_to_simplices.pop();
-                self.vertices.pop();
+                self.pop_vertex();
                 Err(err)
             }
             other => other,
@@ -1298,54 +1251,99 @@ impl Triangulation {
         let mut simplex = simplex.to_vec();
         simplex.sort_unstable();
         self.validate_simplex_indices(&simplex)?;
-        Ok(self.simplices.contains(&simplex))
+        Ok(self.contains_simplex(&simplex))
     }
 
-    /// The simplices containing `vertex`, by reference.
+    /// The simplices containing `vertex`, after validating the index.
     pub fn vertex_to_simplices_for(
         &self,
         vertex: usize,
-    ) -> Result<&FxHashSet<Simplex>, TriangulationError> {
+    ) -> Result<Vec<&Simplex>, TriangulationError> {
         self.validate_vertex_index(vertex)?;
-        Ok(&self.vertex_to_simplices[vertex])
+        Ok(self.simplices_of(vertex).collect())
     }
 
     /// Volumes of all simplices, in iteration order of [`Self::simplices`].
     pub fn volumes(&self) -> Result<Vec<f64>, TriangulationError> {
-        self.simplices
-            .iter()
+        self.simplices()
             .map(|simplex| self.volume(simplex))
             .collect()
     }
 
-    /// Whether [`Self::simplices`] and [`Self::vertex_to_simplices`] are
-    /// mutually consistent (a bookkeeping check, not a geometric one).
+    /// Whether all derived indexes (slab, id map, vertex incidence, facet
+    /// incidence, boundary set, overfull count) are mutually consistent
+    /// (a bookkeeping check, not a geometric one).
     pub fn reference_invariant(&self) -> bool {
-        for vertex in 0..self.vertices.len() {
-            if self.vertex_to_simplices[vertex]
-                .iter()
-                .any(|simplex| !simplex.contains(&vertex))
-            {
+        // Every registered simplex lives in the slab under its id, and every
+        // live slab entry is registered.
+        if self.slab.iter().filter(|slot| slot.is_some()).count() != self.ids.len() {
+            return false;
+        }
+        for (simplex, &id) in &self.ids {
+            if self.slab.get(id as usize).and_then(|slot| slot.as_ref()) != Some(simplex) {
                 return false;
             }
-        }
-        for simplex in &self.simplices {
             if simplex
                 .iter()
-                .any(|point| !self.vertex_to_simplices[*point].contains(simplex))
+                .any(|&vertex| !self.vertex_to_ids[vertex].contains(&id))
             {
                 return false;
             }
         }
-        true
+
+        // Vertex incidence points only at live simplices containing the
+        // vertex.
+        for (vertex, incident) in self.vertex_to_ids.iter().enumerate() {
+            for &id in incident {
+                match self.slab.get(id as usize).and_then(|slot| slot.as_ref()) {
+                    Some(simplex) if simplex.contains(&vertex) => {}
+                    _ => return false,
+                }
+            }
+        }
+
+        // The facet index, boundary set, and overfull count all match a
+        // recount from scratch.
+        let mut expected_facets: FxHashMap<Simplex, FxHashSet<SimplexId>> = FxHashMap::default();
+        for (simplex, &id) in &self.ids {
+            for skip in 0..simplex.len() {
+                expected_facets
+                    .entry(facet_excluding(simplex, skip))
+                    .or_default()
+                    .insert(id);
+            }
+        }
+        if expected_facets.len() != self.facets.len() {
+            return false;
+        }
+        let mut expected_overfull = 0;
+        for (facet, expected_ids) in &expected_facets {
+            let Some(actual) = self.facets.get(facet) else {
+                return false;
+            };
+            let actual_ids: FxHashSet<SimplexId> = actual.iter().copied().collect();
+            if actual.len() != actual_ids.len() || actual_ids != *expected_ids {
+                return false;
+            }
+            if expected_ids.len() == 1 && !self.boundary_facets.contains(facet) {
+                return false;
+            }
+            if expected_ids.len() > 2 {
+                expected_overfull += 1;
+            }
+        }
+        let expected_boundary = expected_facets
+            .values()
+            .filter(|ids| ids.len() == 1)
+            .count();
+        self.boundary_facets.len() == expected_boundary && self.overfull_facets == expected_overfull
     }
 
     /// Vertices on the convex hull (those belonging to a boundary face).
     /// Errors when a face belongs to more than two simplices, which means
     /// the triangulation is internally inconsistent.
     pub fn hull(&self) -> Result<FxHashSet<usize>, TriangulationError> {
-        let counts = self.face_multiplicities(None)?;
-        if counts.values().any(|&count| count > 2) {
+        if self.overfull_facets > 0 {
             return Err(TriangulationError::Runtime(
                 "Broken triangulation, a (N-1)-dimensional appears in more than 2 simplices."
                     .to_string(),
@@ -1353,570 +1351,25 @@ impl Triangulation {
         }
 
         let mut hull = FxHashSet::default();
-        for (face, count) in counts {
-            if count == 1 {
-                hull.extend(face);
-            }
+        for facet in &self.boundary_facets {
+            hull.extend(facet.iter().copied());
         }
         Ok(hull)
-    }
-}
-
-/// Python-facing `Triangulation`, a thin argument-parsing wrapper around the
-/// pure-Rust [`Triangulation`] core. Drop-in compatible with
-/// `adaptive.learner.triangulation.Triangulation`.
-#[pyclass(name = "Triangulation")]
-pub struct PyTriangulation {
-    pub core: Triangulation,
-}
-
-/// Lazy, set-like view of the simplices (all of them, or those of one
-/// vertex) that reads triangulation state on access instead of copying it.
-#[pyclass(name = "SimplicesProxy")]
-pub struct PySimplicesProxy {
-    triangulation: Py<PyTriangulation>,
-    vertex: Option<usize>,
-}
-
-impl PySimplicesProxy {
-    fn all(triangulation: Py<PyTriangulation>) -> Self {
-        Self {
-            triangulation,
-            vertex: None,
-        }
-    }
-
-    fn for_vertex(triangulation: Py<PyTriangulation>, vertex: usize) -> Self {
-        Self {
-            triangulation,
-            vertex: Some(vertex),
-        }
-    }
-}
-
-/// Lazy, sequence-like view of the vertex coordinates (supports `__array__`
-/// for zero-surprise numpy conversion).
-#[pyclass(name = "VerticesProxy")]
-pub struct PyVerticesProxy {
-    triangulation: Py<PyTriangulation>,
-}
-
-impl PyVerticesProxy {
-    fn new(triangulation: Py<PyTriangulation>) -> Self {
-        Self { triangulation }
-    }
-}
-
-/// Lazy, sequence-like view mapping each vertex index to its simplex set.
-#[pyclass(name = "VertexToSimplicesProxy")]
-pub struct PyVertexToSimplicesProxy {
-    triangulation: Py<PyTriangulation>,
-}
-
-impl PyVertexToSimplicesProxy {
-    fn new(triangulation: Py<PyTriangulation>) -> Self {
-        Self { triangulation }
-    }
-}
-
-/// Iterator over a snapshot of faces/simplices as Python tuples.
-#[pyclass]
-pub struct PyFacesIter {
-    items: Vec<Simplex>,
-    index: usize,
-}
-
-#[pyclass]
-pub struct PyVerticesIter {
-    triangulation: Py<PyTriangulation>,
-    index: usize,
-}
-
-#[pyclass]
-pub struct PyVertexToSimplicesIter {
-    triangulation: Py<PyTriangulation>,
-    index: usize,
-}
-
-#[pymethods]
-impl PyFacesIter {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(&mut self, py: Python<'_>) -> Option<Py<PyTuple>> {
-        let item = self.items.get(self.index)?;
-        self.index += 1;
-        Some(simplex_tuple(py, item))
-    }
-}
-
-#[pymethods]
-impl PySimplicesProxy {
-    fn __contains__(&self, py: Python<'_>, simplex: &Bound<'_, PyTuple>) -> bool {
-        let triangulation = self.triangulation.bind(py).borrow();
-        let Ok(simplex) =
-            canonical_simplex_from_py(simplex.as_any(), triangulation.core.vertices.len())
-        else {
-            return false;
-        };
-
-        match self.vertex {
-            Some(vertex) => triangulation.core.vertex_to_simplices[vertex].contains(&simplex),
-            None => triangulation.core.simplices.contains(&simplex),
-        }
-    }
-
-    fn __iter__(&self, py: Python<'_>) -> PyFacesIter {
-        let triangulation = self.triangulation.bind(py).borrow();
-        let items = match self.vertex {
-            Some(vertex) => triangulation.core.vertex_to_simplices[vertex]
-                .iter()
-                .cloned()
-                .collect(),
-            None => triangulation.core.simplices.iter().cloned().collect(),
-        };
-        PyFacesIter { items, index: 0 }
-    }
-
-    fn __len__(&self, py: Python<'_>) -> usize {
-        let triangulation = self.triangulation.bind(py).borrow();
-        match self.vertex {
-            Some(vertex) => triangulation.core.vertex_to_simplices[vertex].len(),
-            None => triangulation.core.simplices.len(),
-        }
-    }
-}
-
-#[pymethods]
-impl PyVerticesIter {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(&mut self, py: Python<'_>) -> Option<Py<PyTuple>> {
-        let triangulation = self.triangulation.bind(py).borrow();
-        let vertex = triangulation.core.vertices.get(self.index)?;
-        self.index += 1;
-        Some(point_tuple(py, vertex))
-    }
-}
-
-#[pymethods]
-impl PyVertexToSimplicesIter {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(&mut self, py: Python<'_>) -> Option<Py<PyAny>> {
-        let triangulation = self.triangulation.bind(py).borrow();
-        if self.index >= triangulation.core.vertices.len() {
-            return None;
-        }
-        let simplices =
-            simplex_set_py(py, &triangulation.core.vertex_to_simplices[self.index]).ok()?;
-        self.index += 1;
-        Some(simplices)
-    }
-}
-
-#[pymethods]
-impl PyVerticesProxy {
-    fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Py<PyTuple>> {
-        let triangulation = self.triangulation.bind(py).borrow();
-        let index = normalize_index(index, triangulation.core.vertices.len())
-            .map_err(TriangulationError::into_pyerr)?;
-        Ok(point_tuple(py, &triangulation.core.vertices[index]))
-    }
-
-    fn __len__(&self, py: Python<'_>) -> usize {
-        self.triangulation.bind(py).borrow().core.vertices.len()
-    }
-
-    fn __iter__(&self, py: Python<'_>) -> PyVerticesIter {
-        PyVerticesIter {
-            triangulation: self.triangulation.clone_ref(py),
-            index: 0,
-        }
-    }
-
-    #[pyo3(signature = (dtype=None, copy=None))]
-    fn __array__(
-        &self,
-        py: Python<'_>,
-        dtype: Option<&Bound<'_, PyAny>>,
-        copy: Option<bool>,
-    ) -> PyResult<Py<PyAny>> {
-        let triangulation = self.triangulation.bind(py).borrow();
-        let vertices = point_list_py(py, &triangulation.core.vertices)?;
-        let numpy = PyModule::import(py, "numpy")?;
-        let kwargs = PyDict::new(py);
-        if let Some(dtype) = dtype {
-            kwargs.set_item("dtype", dtype)?;
-        }
-        let array = if copy == Some(false) {
-            numpy.call_method("asarray", (vertices,), Some(&kwargs))?
-        } else {
-            if let Some(copy) = copy {
-                kwargs.set_item("copy", copy)?;
-            }
-            numpy.call_method("array", (vertices,), Some(&kwargs))?
-        };
-        Ok(array.into())
-    }
-}
-
-#[pymethods]
-impl PyVertexToSimplicesProxy {
-    fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Py<PyAny>> {
-        let triangulation = self.triangulation.bind(py).borrow();
-        let index = normalize_index(index, triangulation.core.vertices.len())
-            .map_err(TriangulationError::into_pyerr)?;
-        simplex_set_py(py, &triangulation.core.vertex_to_simplices[index])
-    }
-
-    fn __len__(&self, py: Python<'_>) -> usize {
-        self.triangulation.bind(py).borrow().core.vertices.len()
-    }
-
-    fn __iter__(&self, py: Python<'_>) -> PyVertexToSimplicesIter {
-        PyVertexToSimplicesIter {
-            triangulation: self.triangulation.clone_ref(py),
-            index: 0,
-        }
-    }
-}
-
-#[pymethods]
-impl PyTriangulation {
-    #[new]
-    fn new(py: Python<'_>, coords: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let parsed_coords =
-            parse_points_sized(coords, "Please provide a 2-dimensional list of points")?;
-        let dim = Triangulation::validate_coords(&parsed_coords)
-            .map_err(TriangulationError::into_pyerr)?;
-
-        let core = match scipy_delaunay_simplices(py, &parsed_coords, dim)? {
-            Some(initial) => Triangulation::from_simplices(parsed_coords, initial),
-            None => Triangulation::new(parsed_coords),
-        }
-        .map_err(TriangulationError::into_pyerr)?;
-        Ok(Self { core })
-    }
-
-    fn add_simplex(&mut self, simplex: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.core
-            .add_simplex(canonical_simplex_from_py(
-                simplex,
-                self.core.vertices.len(),
-            )?)
-            .map_err(TriangulationError::into_pyerr)
-    }
-
-    fn delete_simplex(&mut self, simplex: &Bound<'_, PyAny>) -> PyResult<()> {
-        let simplex = canonical_simplex_from_py(simplex, self.core.vertices.len())?;
-        self.core
-            .delete_simplex(&simplex)
-            .map_err(TriangulationError::into_pyerr)
-    }
-
-    #[pyo3(signature = (point, simplex=None, transform=None))]
-    fn add_point(
-        &mut self,
-        py: Python<'_>,
-        point: &Bound<'_, PyAny>,
-        simplex: Option<&Bound<'_, PyAny>>,
-        transform: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
-        let point = parse_point(point)?;
-        let simplex = match simplex {
-            None => None,
-            Some(value) if value.is_none() => None,
-            Some(value) => Some(canonical_simplex_from_py(value, self.core.vertices.len())?),
-        };
-        let transform = parse_optional_transform(transform)?;
-        let (deleted, added) = self
-            .core
-            .add_point(point, simplex, transform)
-            .map_err(TriangulationError::into_pyerr)?;
-        Ok((simplex_set_py(py, &deleted)?, simplex_set_py(py, &added)?))
-    }
-
-    #[getter(vertices)]
-    fn vertices_property(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyVerticesProxy>> {
-        Py::new(py, PyVerticesProxy::new(slf.into()))
-    }
-
-    #[getter(simplices)]
-    fn simplices_property(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PySimplicesProxy>> {
-        Py::new(py, PySimplicesProxy::all(slf.into()))
-    }
-
-    #[getter(vertex_to_simplices)]
-    fn vertex_to_simplices_property(
-        slf: PyRef<'_, Self>,
-        py: Python<'_>,
-    ) -> PyResult<Py<PyVertexToSimplicesProxy>> {
-        Py::new(py, PyVertexToSimplicesProxy::new(slf.into()))
-    }
-
-    fn has_simplex(&self, simplex: &Bound<'_, PyTuple>) -> bool {
-        let Ok(simplex) = canonical_simplex_from_py(simplex.as_any(), self.core.vertices.len())
-        else {
-            return false;
-        };
-        self.core.simplices.contains(&simplex)
-    }
-
-    fn vertex_to_simplices_for(
-        slf: PyRef<'_, Self>,
-        py: Python<'_>,
-        vertex: isize,
-    ) -> PyResult<Py<PySimplicesProxy>> {
-        let vertex = normalize_index(vertex, slf.core.vertices.len())
-            .map_err(TriangulationError::into_pyerr)?;
-        Py::new(py, PySimplicesProxy::for_vertex(slf.into(), vertex))
-    }
-
-    #[getter(hull)]
-    fn hull_property(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let hull = self.core.hull().map_err(TriangulationError::into_pyerr)?;
-        let vertices: Vec<usize> = hull.into_iter().collect();
-        Ok(PySet::new(py, &vertices)?.into())
-    }
-
-    #[getter(dim)]
-    fn dim_property(&self) -> usize {
-        self.core.dim
-    }
-
-    #[pyo3(name = "get_vertices")]
-    fn get_vertices_method(
-        &self,
-        py: Python<'_>,
-        indices: &Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyAny>> {
-        let indices = ordered_indices_from_py(indices, self.core.vertices.len())?;
-        point_list_py(
-            py,
-            &self
-                .core
-                .get_vertices(&indices)
-                .map_err(TriangulationError::into_pyerr)?,
-        )
-    }
-
-    fn locate_point(&self, py: Python<'_>, point: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let point = parse_point(point)?;
-        match self
-            .core
-            .locate_point(&point)
-            .map_err(TriangulationError::into_pyerr)?
-        {
-            Some(simplex) => Ok(simplex_tuple(py, &simplex).into()),
-            None => Ok(PyTuple::empty(py).into()),
-        }
-    }
-
-    #[pyo3(signature = (point, simplex, eps=BARYCENTRIC_EPS))]
-    fn get_reduced_simplex(
-        &self,
-        py: Python<'_>,
-        point: &Bound<'_, PyAny>,
-        simplex: &Bound<'_, PyAny>,
-        eps: f64,
-    ) -> PyResult<Py<PyAny>> {
-        let point = parse_point(point)?;
-        let simplex_signed = parse_signed_indices(simplex)?;
-        // For a full simplex the reference echoes back the caller's indices
-        // (including negative ones), so reduce positions rather than values.
-        if simplex_signed.len() == self.core.dim + 1 {
-            self.core
-                .validate_point_dim(&point)
-                .map_err(TriangulationError::into_pyerr)?;
-            let simplex = normalize_indices(&simplex_signed, self.core.vertices.len())
-                .map_err(TriangulationError::into_pyerr)?;
-            let alpha = match self.core.barycentric_alpha_for_simplex(&simplex, &point) {
-                Ok(alpha) => alpha,
-                Err(TriangulationError::Geometry(GeometryError::SingularMatrix)) => {
-                    return Err(numpy_linalg_error(py, "Singular matrix"));
-                }
-                Err(other) => return Err(other.into_pyerr()),
-            };
-            let reduced: Vec<isize> = reduced_simplex_positions(&alpha, eps)
-                .into_iter()
-                .map(|position| simplex_signed[position])
-                .collect();
-            return signed_index_list_py(py, &reduced);
-        }
-
-        let simplex = normalize_indices(&simplex_signed, self.core.vertices.len())
-            .map_err(TriangulationError::into_pyerr)?;
-        let reduced = match self.core.get_reduced_simplex(&point, &simplex, eps) {
-            Ok(reduced) => reduced,
-            Err(TriangulationError::Geometry(GeometryError::SingularMatrix)) => {
-                return Err(numpy_linalg_error(py, "Singular matrix"));
-            }
-            Err(other) => return Err(other.into_pyerr()),
-        };
-        index_list_py(py, &reduced)
-    }
-
-    #[pyo3(signature = (simplex, transform=None))]
-    fn circumscribed_circle(
-        &self,
-        py: Python<'_>,
-        simplex: &Bound<'_, PyAny>,
-        transform: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<(Py<PyTuple>, f64)> {
-        let simplex = ordered_indices_from_py(simplex, self.core.vertices.len())?;
-        let transform = parse_optional_transform(transform)?;
-        let (center, radius) = self
-            .core
-            .circumscribed_circle(&simplex, &transform)
-            .map_err(TriangulationError::into_pyerr)?;
-        Ok((point_tuple(py, &center), radius))
-    }
-
-    #[pyo3(signature = (pt_index, simplex, transform=None))]
-    fn point_in_circumcircle(
-        &self,
-        pt_index: isize,
-        simplex: &Bound<'_, PyAny>,
-        transform: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<bool> {
-        let pt_index = normalize_index(pt_index, self.core.vertices.len())
-            .map_err(TriangulationError::into_pyerr)?;
-        let simplex = ordered_indices_from_py(simplex, self.core.vertices.len())?;
-        let transform = parse_optional_transform(transform)?;
-        self.core
-            .point_in_circumcircle(pt_index, &simplex, &transform)
-            .map_err(TriangulationError::into_pyerr)
-    }
-
-    #[pyo3(name = "point_in_cicumcircle", signature = (pt_index, simplex, transform=None))]
-    fn point_in_cicumcircle(
-        &self,
-        pt_index: isize,
-        simplex: &Bound<'_, PyAny>,
-        transform: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<bool> {
-        self.point_in_circumcircle(pt_index, simplex, transform)
-    }
-
-    fn volume(&self, simplex: &Bound<'_, PyAny>) -> PyResult<f64> {
-        let simplex = ordered_indices_from_py(simplex, self.core.vertices.len())?;
-        self.core
-            .volume(&simplex)
-            .map_err(TriangulationError::into_pyerr)
-    }
-
-    fn volumes(&self) -> PyResult<Vec<f64>> {
-        self.core.volumes().map_err(TriangulationError::into_pyerr)
-    }
-
-    #[pyo3(signature = (dim=None, simplices=None, vertices=None))]
-    fn faces(
-        &self,
-        dim: Option<usize>,
-        simplices: Option<&Bound<'_, PyAny>>,
-        vertices: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<PyFacesIter> {
-        let simplices = match simplices {
-            None => None,
-            Some(value) if value.is_none() => None,
-            Some(value) => Some(simplex_set_from_py(value, self.core.vertices.len())?),
-        };
-        let vertices = match vertices {
-            None => None,
-            Some(value) if value.is_none() => None,
-            Some(value) => Some(vertex_index_set_from_py(value, self.core.vertices.len())?),
-        };
-        let items = self
-            .core
-            .faces(dim, simplices.as_ref(), vertices.as_ref())
-            .map_err(TriangulationError::into_pyerr)?;
-        Ok(PyFacesIter { items, index: 0 })
-    }
-
-    fn containing(&self, py: Python<'_>, face: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let face = ordered_indices_from_py(face, self.core.vertices.len())?;
-        simplex_set_py(
-            py,
-            &self
-                .core
-                .containing(&face)
-                .map_err(TriangulationError::into_pyerr)?,
-        )
-    }
-
-    fn reference_invariant(&self) -> bool {
-        self.core.reference_invariant()
-    }
-
-    #[getter(default_transform)]
-    fn default_transform_property(&self, py: Python<'_>) -> PyResult<Py<PyArray2<f64>>> {
-        let identity = identity_transform(self.core.dim);
-        Ok(PyArray2::from_vec2(py, &identity)?.into())
-    }
-
-    #[pyo3(signature = (point, simplex, eps=BARYCENTRIC_EPS))]
-    fn point_in_simplex(
-        &self,
-        py: Python<'_>,
-        point: &Bound<'_, PyAny>,
-        simplex: &Bound<'_, PyAny>,
-        eps: f64,
-    ) -> PyResult<bool> {
-        let point = parse_point(point)?;
-        let simplex = ordered_indices_from_py(simplex, self.core.vertices.len())?;
-        match self.core.point_in_simplex(&point, &simplex, eps) {
-            Ok(result) => Ok(result),
-            Err(TriangulationError::Geometry(GeometryError::DegenerateSimplex)) => {
-                Err(PyZeroDivisionError::new_err("division by zero"))
-            }
-            Err(TriangulationError::Geometry(GeometryError::SingularMatrix)) => {
-                Err(numpy_linalg_error(py, "Singular matrix"))
-            }
-            Err(other) => Err(other.into_pyerr()),
-        }
-    }
-
-    #[pyo3(signature = (pt_index, containing_simplex=None, transform=None))]
-    fn bowyer_watson(
-        &mut self,
-        py: Python<'_>,
-        pt_index: isize,
-        containing_simplex: Option<&Bound<'_, PyAny>>,
-        transform: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
-        let pt_index = normalize_index(pt_index, self.core.vertices.len())
-            .map_err(TriangulationError::into_pyerr)?;
-        let containing_simplex = match containing_simplex {
-            None => None,
-            Some(value) if value.is_none() => None,
-            Some(value) => Some(canonical_simplex_from_py(value, self.core.vertices.len())?),
-        };
-        let transform = parse_optional_transform(transform)?;
-        let (deleted, added) = self
-            .core
-            .bowyer_watson(pt_index, containing_simplex, &transform)
-            .map_err(TriangulationError::into_pyerr)?;
-        Ok((simplex_set_py(py, &deleted)?, simplex_set_py(py, &added)?))
-    }
-
-    fn vertex_invariant(&self, _vertex: usize) -> PyResult<bool> {
-        Err(PyNotImplementedError::new_err("vertex_invariant"))
-    }
-
-    fn convex_invariant(&self, _vertex: usize) -> PyResult<bool> {
-        Err(PyNotImplementedError::new_err("convex_invariant"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn simplex_set(triangulation: &Triangulation) -> FxHashSet<Simplex> {
+        triangulation.simplices().cloned().collect()
+    }
+
+    fn all_vertices_connected(triangulation: &Triangulation) -> bool {
+        (0..triangulation.vertices.len())
+            .all(|vertex| triangulation.vertex_simplex_count(vertex) > 0)
+    }
 
     fn sample_triangulation() -> Triangulation {
         Triangulation::from_simplices(
@@ -1946,8 +1399,57 @@ mod tests {
         let simplices = tri.vertex_to_simplices_for(0).unwrap();
 
         assert_eq!(simplices.len(), 2);
-        assert!(simplices.contains(&vec![0, 1, 3]));
-        assert!(simplices.contains(&vec![0, 2, 3]));
+        assert!(simplices.contains(&&vec![0, 1, 3]));
+        assert!(simplices.contains(&&vec![0, 2, 3]));
+    }
+
+    #[test]
+    fn add_and_delete_simplex_keep_indexes_consistent() {
+        let mut tri = sample_triangulation();
+        assert!(tri.reference_invariant());
+
+        tri.delete_simplex(&[0, 1, 3]).unwrap();
+        assert!(tri.reference_invariant());
+        assert!(!tri.has_simplex(&[0, 1, 3]).unwrap());
+        assert_eq!(tri.num_simplices(), 1);
+
+        tri.add_simplex(vec![3, 1, 0]).unwrap();
+        assert!(tri.reference_invariant());
+        assert!(tri.has_simplex(&[0, 1, 3]).unwrap());
+
+        let err = tri.delete_simplex(&[0, 1, 2]).unwrap_err();
+        assert!(matches!(err, TriangulationError::Value(_)));
+    }
+
+    #[test]
+    fn containing_uses_facet_index_for_facet_queries() {
+        let tri = sample_triangulation();
+
+        // Shared interior facet, in arbitrary vertex order.
+        let interior = tri.containing(&[3, 0]).unwrap();
+        assert_eq!(
+            interior,
+            FxHashSet::from_iter([vec![0, 1, 3], vec![0, 2, 3]])
+        );
+        // Hull facet.
+        assert_eq!(
+            tri.containing(&[0, 1]).unwrap(),
+            FxHashSet::from_iter([vec![0, 1, 3]])
+        );
+        // Non-existent facet.
+        assert!(tri.containing(&[1, 2]).unwrap().is_empty());
+        // Sub-facet face (single vertex in 2D) still works.
+        assert_eq!(tri.containing(&[1]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hull_is_maintained_incrementally() {
+        let mut tri = sample_triangulation();
+        assert_eq!(tri.hull().unwrap(), FxHashSet::from_iter([0, 1, 2, 3]));
+
+        tri.add_point(vec![2.0, 0.5], None, None).unwrap();
+        assert_eq!(tri.hull().unwrap(), FxHashSet::from_iter([0, 1, 2, 3, 4]));
+        assert!(tri.reference_invariant());
     }
 
     #[test]
@@ -1956,7 +1458,7 @@ mod tests {
 
         assert_eq!(tri.dim, 1);
         assert_eq!(
-            tri.simplices,
+            simplex_set(&tri),
             FxHashSet::from_iter([vec![0, 2], vec![1, 2], vec![0, 3]])
         );
         assert_eq!(tri.hull().unwrap(), FxHashSet::from_iter([1, 3]));
@@ -1971,7 +1473,7 @@ mod tests {
         assert_eq!(deleted, FxHashSet::from_iter([vec![0, 1]]));
         assert_eq!(added, FxHashSet::from_iter([vec![0, 2], vec![1, 2]]));
         assert_eq!(
-            tri.simplices,
+            simplex_set(&tri),
             FxHashSet::from_iter([vec![0, 2], vec![1, 2]])
         );
     }
@@ -1983,7 +1485,7 @@ mod tests {
         let coords: Vec<Vec<f64>> = (0..50).map(|i| vec![100.0 + i as f64 * 2e-5]).collect();
         let tri = Triangulation::new(coords).unwrap();
 
-        assert_eq!(tri.simplices.len(), 49);
+        assert_eq!(tri.num_simplices(), 49);
         assert_eq!(tri.hull().unwrap(), FxHashSet::from_iter([0, 49]));
         assert!(tri.reference_invariant());
     }
@@ -2016,8 +1518,8 @@ mod tests {
 
         assert_eq!(deleted.len(), 2);
         assert_eq!(added.len(), 4);
-        assert_eq!(tri.simplices.len(), 4);
-        assert!((0..tri.vertices.len()).all(|v| !tri.vertex_to_simplices[v].is_empty()));
+        assert_eq!(tri.num_simplices(), 4);
+        assert!(all_vertices_connected(&tri));
     }
 
     #[test]
@@ -2033,7 +1535,7 @@ mod tests {
             vec![0.5, 0.5 + 1e-6],
         ])
         .unwrap();
-        let simplices_before = tri.simplices.clone();
+        let simplices_before = simplex_set(&tri);
         let n_vertices_before = tri.vertices.len();
 
         let err = tri
@@ -2041,7 +1543,7 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, TriangulationError::Value(_)));
-        assert_eq!(tri.simplices, simplices_before);
+        assert_eq!(simplex_set(&tri), simplices_before);
         assert_eq!(tri.vertices.len(), n_vertices_before);
         assert!(tri.reference_invariant());
     }
@@ -2057,6 +1559,6 @@ mod tests {
 
         assert_eq!(deleted, FxHashSet::from_iter([vec![1, 2]]));
         assert_eq!(added, FxHashSet::from_iter([vec![1, 3], vec![2, 3]]));
-        assert!((0..tri.vertices.len()).all(|v| !tri.vertex_to_simplices[v].is_empty()));
+        assert!(all_vertices_connected(&tri));
     }
 }
