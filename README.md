@@ -10,7 +10,8 @@ Drop-in replacement for [adaptive](https://github.com/python-adaptive/adaptive)'
 
 ## Performance
 
-Measured with the scripts in [`examples/`](examples/) (best of 3 for the standalone runs); absolute times are machine-dependent, ratios are representative.
+Measured with the scripts in [`examples/`](examples/), best of 3 for the standalone runs.
+Absolute times are machine-dependent; the ratios are representative.
 
 ### Standalone triangulation (incremental insertion)
 | Case | Rust | Python | Speedup |
@@ -27,7 +28,8 @@ Measured with the scripts in [`examples/`](examples/) (best of 3 for the standal
 | 2,000 | 0.90 s | 1.16 s | **0.32 s** |
 | 5,000 | 5.64 s | 2.95 s | **0.81 s** |
 
-LearnerND + Rust is **3.7× faster** than LearnerND + Python, and **7× faster** than Learner2D at 5K points. The end-to-end ratio is smaller than the standalone one because adaptive's own Python-side loss machinery dominates once the triangulation is fast.
+LearnerND + Rust is **3.7× faster** than LearnerND + Python, and **7× faster** than Learner2D at 5K points.
+The end-to-end ratio is smaller than the standalone one because adaptive's own Python-side loss machinery dominates once the triangulation is fast.
 
 ## Installation
 
@@ -35,7 +37,8 @@ LearnerND + Rust is **3.7× faster** than LearnerND + Python, and **7× faster**
 pip install adaptive-triangulation
 ```
 
-Requires a Rust toolchain for building from source. Pre-built wheels are available for common platforms via CI.
+Requires a Rust toolchain for building from source.
+Pre-built wheels are available for common platforms via CI.
 
 ## Quick start
 
@@ -120,16 +123,10 @@ from adaptive_triangulation import (
 
 ## Robustness on degenerate input
 
-Point sets that mix widely separated coordinate scales force sliver simplices
-that no floating-point predicate can handle reliably. Unlike the Python
-reference (which can corrupt its state on such input), this implementation
-validates every insertion before mutating: a cavity that cannot be
-re-triangulated is first repaired with exact predicates (Shewchuk's, via the
-[`robust`](https://crates.io/crates/robust) crate), and if even that fails the
-insertion raises with the triangulation untouched, so callers can skip the
-point and continue. Well-conditioned inputs behave identically to the
-reference. The full policy is documented in
-[`src/tolerances.rs`](src/tolerances.rs).
+Point sets that mix widely separated coordinate scales force sliver simplices that no floating-point predicate can handle reliably.
+Unlike the Python reference (which can corrupt its state on such input), this implementation validates every insertion before mutating: a cavity that cannot be re-triangulated is first repaired with exact predicates (Shewchuk's, via the [`robust`](https://crates.io/crates/robust) crate), and if even that fails the insertion raises with the triangulation untouched, so callers can skip the point and continue.
+Well-conditioned inputs behave identically to the reference.
+The full policy is documented in [`src/tolerances.rs`](src/tolerances.rs).
 
 ## Development
 
