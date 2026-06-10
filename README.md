@@ -6,25 +6,28 @@
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
 Fast N-dimensional Delaunay triangulation in Rust with Python bindings (PyO3).
-Drop-in replacement for [adaptive](https://github.com/python-adaptive/adaptive)'s `Triangulation` class — **5-99× faster**.
+Drop-in replacement for [adaptive](https://github.com/python-adaptive/adaptive)'s `Triangulation` class — **30-300× faster** standalone, **3.7×** end-to-end in `LearnerND` (where adaptive's own Python code dominates).
 
 ## Performance
+
+Measured with the scripts in [`examples/`](examples/) (best of 3 for the standalone runs); absolute times are machine-dependent, ratios are representative.
 
 ### Standalone triangulation (incremental insertion)
 | Case | Rust | Python | Speedup |
 |---|---:|---:|---:|
-| 2D, 1K pts | 38.5 ms | 668 ms | **17×** |
-| 2D, 5K pts | 260 ms | 8,547 ms | **33×** |
-| 3D, 500 pts | 133 ms | 5,571 ms | **42×** |
+| 2D, 1K pts | 18 ms | 731 ms | **40×** |
+| 2D, 5K pts | 134 ms | 14,611 ms | **109×** |
+| 3D, 500 pts | 32 ms | 3,001 ms | **94×** |
+| 3D, 2K pts | 152 ms | 44,262 ms | **291×** |
 
 ### LearnerND integration (end-to-end, `ring_of_fire` 2D)
 | N pts | Learner2D (scipy) | LearnerND (Python) | LearnerND (Rust) |
 |---|---:|---:|---:|
-| 1,000 | 0.34 s | 0.91 s | **0.23 s** |
-| 2,000 | 1.17 s | 1.80 s | **0.38 s** |
-| 5,000 | 6.99 s | 4.57 s | **0.99 s** |
+| 1,000 | 0.23 s | 0.59 s | **0.16 s** |
+| 2,000 | 0.90 s | 1.16 s | **0.32 s** |
+| 5,000 | 5.64 s | 2.95 s | **0.81 s** |
 
-LearnerND + Rust is **5× faster** than LearnerND + Python, and **7× faster** than Learner2D at 5K points.
+LearnerND + Rust is **3.7× faster** than LearnerND + Python, and **7× faster** than Learner2D at 5K points. The end-to-end ratio is smaller than the standalone one because adaptive's own Python-side loss machinery dominates once the triangulation is fast.
 
 ## Installation
 
@@ -67,7 +70,8 @@ lnd_mod.circumsphere = at.circumsphere
 lnd_mod.simplex_volume_in_embedding = at.simplex_volume_in_embedding
 lnd_mod.point_in_simplex = at.point_in_simplex
 
-# Now use LearnerND as normal — it's 5× faster
+# Now use LearnerND as normal — including neighbor-aware losses
+# like curvature_loss_function()
 learner = LearnerND(my_function, bounds=[(-1, 1), (-1, 1)])
 ```
 
@@ -87,6 +91,8 @@ tri.volumes()                          # All simplex volumes
 tri.point_in_simplex(point, simplex)   # Containment test
 tri.point_in_circumcircle(pt, simplex) # Circumcircle test
 tri.bowyer_watson(pt_index)            # Direct Bowyer-Watson
+tri.get_opposing_vertices(simplex)     # Facet neighbours' opposite vertices
+tri.get_simplices_attached_to_points(simplex)  # Facet-sharing neighbours
 tri.reference_invariant()              # Consistency check
 ```
 
@@ -111,6 +117,19 @@ from adaptive_triangulation import (
 - [`examples/basic_usage.py`](examples/basic_usage.py) — Core API walkthrough
 - [`examples/adaptive_learnernd.py`](examples/adaptive_learnernd.py) — LearnerND integration with timing
 - [`examples/benchmark_vs_python.py`](examples/benchmark_vs_python.py) — Standalone benchmarks across dimensions
+
+## Robustness on degenerate input
+
+Point sets that mix widely separated coordinate scales force sliver simplices
+that no floating-point predicate can handle reliably. Unlike the Python
+reference (which can corrupt its state on such input), this implementation
+validates every insertion before mutating: a cavity that cannot be
+re-triangulated is first repaired with exact predicates (Shewchuk's, via the
+[`robust`](https://crates.io/crates/robust) crate), and if even that fails the
+insertion raises with the triangulation untouched, so callers can skip the
+point and continue. Well-conditioned inputs behave identically to the
+reference. The full policy is documented in
+[`src/tolerances.rs`](src/tolerances.rs).
 
 ## Development
 
