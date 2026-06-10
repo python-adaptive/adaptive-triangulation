@@ -22,6 +22,7 @@ numpy = "0.23"
 nalgebra = "0.33"
 thiserror = "2"
 rustc-hash = "2"
+smallvec = "1"
 
 [profile.release]
 lto = true

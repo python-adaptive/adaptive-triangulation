@@ -206,12 +206,12 @@ pub(crate) fn simplex_tuple(py: Python<'_>, simplex: &[usize]) -> Py<PyTuple> {
     PyTuple::new(py, simplex.iter().copied()).unwrap().into()
 }
 
-pub(crate) fn simplex_set_py(
+pub(crate) fn simplex_set_py<'a>(
     py: Python<'_>,
-    simplices: &FxHashSet<Simplex>,
+    simplices: impl IntoIterator<Item = &'a Simplex>,
 ) -> PyResult<Py<PyAny>> {
     let tuples: Vec<Py<PyAny>> = simplices
-        .iter()
+        .into_iter()
         .map(|simplex| simplex_tuple(py, simplex).into())
         .collect();
     Ok(PySet::new(py, &tuples)?.into())
@@ -385,19 +385,16 @@ impl PySimplicesProxy {
         };
 
         match self.vertex {
-            Some(vertex) => triangulation.core.vertex_to_simplices[vertex].contains(&simplex),
-            None => triangulation.core.simplices.contains(&simplex),
+            Some(vertex) => triangulation.core.vertex_has_simplex(vertex, &simplex),
+            None => triangulation.core.contains_simplex(&simplex),
         }
     }
 
     fn __iter__(&self, py: Python<'_>) -> PyFacesIter {
         let triangulation = self.triangulation.bind(py).borrow();
         let items = match self.vertex {
-            Some(vertex) => triangulation.core.vertex_to_simplices[vertex]
-                .iter()
-                .cloned()
-                .collect(),
-            None => triangulation.core.simplices.iter().cloned().collect(),
+            Some(vertex) => triangulation.core.simplices_of(vertex).cloned().collect(),
+            None => triangulation.core.simplices().cloned().collect(),
         };
         PyFacesIter { items, index: 0 }
     }
@@ -405,8 +402,8 @@ impl PySimplicesProxy {
     fn __len__(&self, py: Python<'_>) -> usize {
         let triangulation = self.triangulation.bind(py).borrow();
         match self.vertex {
-            Some(vertex) => triangulation.core.vertex_to_simplices[vertex].len(),
-            None => triangulation.core.simplices.len(),
+            Some(vertex) => triangulation.core.vertex_simplex_count(vertex),
+            None => triangulation.core.num_simplices(),
         }
     }
 }
@@ -436,8 +433,7 @@ impl PyVertexToSimplicesIter {
         if self.index >= triangulation.core.vertices.len() {
             return None;
         }
-        let simplices =
-            simplex_set_py(py, &triangulation.core.vertex_to_simplices[self.index]).ok()?;
+        let simplices = simplex_set_py(py, triangulation.core.simplices_of(self.index)).ok()?;
         self.index += 1;
         Some(simplices)
     }
@@ -495,7 +491,7 @@ impl PyVertexToSimplicesProxy {
         let triangulation = self.triangulation.bind(py).borrow();
         let index = normalize_index(index, triangulation.core.vertices.len())
             .map_err(TriangulationError::into_pyerr)?;
-        simplex_set_py(py, &triangulation.core.vertex_to_simplices[index])
+        simplex_set_py(py, triangulation.core.simplices_of(index))
     }
 
     fn __len__(&self, py: Python<'_>) -> usize {
@@ -588,7 +584,7 @@ impl PyTriangulation {
         else {
             return false;
         };
-        self.core.simplices.contains(&simplex)
+        self.core.contains_simplex(&simplex)
     }
 
     fn vertex_to_simplices_for(

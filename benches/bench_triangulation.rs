@@ -32,8 +32,7 @@ fn generate_points(dim: usize, count: usize, seed: u64) -> Vec<Vec<f64>> {
 
 fn first_simplex(triangulation: &Triangulation) -> Simplex {
     triangulation
-        .simplices
-        .iter()
+        .simplices()
         .next()
         .cloned()
         .expect("triangulation should not be empty")
@@ -72,9 +71,7 @@ fn outside_point(triangulation: &Triangulation) -> Vec<f64> {
 }
 
 fn insert_pending_vertex(triangulation: &mut Triangulation, point: Vec<f64>) -> usize {
-    triangulation.vertex_to_simplices.push(Default::default());
-    triangulation.vertices.push(point);
-    triangulation.vertices.len() - 1
+    triangulation.add_vertex(point)
 }
 
 fn constructor_benches(c: &mut Criterion) {
@@ -101,7 +98,7 @@ fn constructor_benches(c: &mut Criterion) {
                         let coords = points.clone();
                         let start = Instant::now();
                         let triangulation = Triangulation::new(coords).unwrap();
-                        black_box(triangulation.simplices.len());
+                        black_box(triangulation.num_simplices());
                         total += start.elapsed();
                     }
                     total
@@ -130,7 +127,7 @@ fn add_point_bench(c: &mut Criterion) {
                 for point in &to_insert {
                     triangulation.add_point(point.clone(), None, None).unwrap();
                 }
-                black_box(triangulation.simplices.len());
+                black_box(triangulation.num_simplices());
                 total += start.elapsed();
             }
             total
@@ -191,7 +188,7 @@ fn locate_and_containing_benches(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(8));
 
     let triangulation = Triangulation::new(generate_points(2, 2048, 0xFACE)).unwrap();
-    let simplices: Vec<Simplex> = triangulation.simplices.iter().take(256).cloned().collect();
+    let simplices: Vec<Simplex> = triangulation.simplices().take(256).cloned().collect();
     let queries: Vec<Vec<f64>> = simplices
         .iter()
         .map(|simplex| simplex_centroid(&triangulation, simplex))
