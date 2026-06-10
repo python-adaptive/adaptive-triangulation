@@ -1,5 +1,16 @@
+//! N-dimensional Delaunay triangulation with incremental Bowyer-Watson
+//! point insertion.
+//!
+//! The module has two layers: the pure-Rust [`Triangulation`] core, which
+//! holds all state and algorithms and never touches Python, and the PyO3
+//! surface ([`PyTriangulation`] plus the proxy/iterator classes) which only
+//! parses arguments, forwards to the core, and converts results and errors.
+//! The Python API deliberately mirrors `adaptive.learner.triangulation`
+//! (including its `point_in_cicumcircle` typo), so adaptive can use either
+//! backend interchangeably.
+
 use std::collections::VecDeque;
-use std::sync::RwLock;
+use std::sync::{PoisonError, RwLock};
 
 use numpy::PyArray2;
 use pyo3::exceptions::{
@@ -12,22 +23,33 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
 
 use crate::geometry::{self, GeometryError};
+use crate::tolerances::{
+    BARYCENTRIC_EPS, CIRCUMCIRCLE_RTOL, DEGENERATE_VOLUME_EPS, VOLUME_CONSERVATION_ATOL,
+    VOLUME_CONSERVATION_RTOL,
+};
 
+/// Index of a vertex in [`Triangulation::vertices`].
 pub type PointIndex = usize;
+/// A simplex as a sorted list of vertex indices.
 pub type Simplex = Vec<PointIndex>;
 
-const DEFAULT_EPS: f64 = 1e-8;
-
+/// Errors from triangulation operations. Each variant maps onto the Python
+/// exception type the reference implementation raises in the same situation.
 #[derive(Debug, Error)]
 pub enum TriangulationError {
+    /// Maps to `ValueError`.
     #[error("{0}")]
     Value(String),
+    /// Maps to `IndexError`.
     #[error("{0}")]
     Index(String),
+    /// Maps to `RuntimeError`.
     #[error("{0}")]
     Runtime(String),
+    /// Maps to `AssertionError` (the reference uses bare `assert`).
     #[error("{0}")]
     Assertion(String),
+    /// Maps to `ValueError`.
     #[error(transparent)]
     Geometry(#[from] GeometryError),
 }
@@ -39,10 +61,7 @@ impl TriangulationError {
             Self::Index(message) => PyIndexError::new_err(message),
             Self::Runtime(message) => PyRuntimeError::new_err(message),
             Self::Assertion(message) => PyAssertionError::new_err(message),
-            Self::Geometry(error) => match error {
-                GeometryError::SingularMatrix => PyValueError::new_err(error.to_string()),
-                _ => PyValueError::new_err(error.to_string()),
-            },
+            Self::Geometry(error) => PyValueError::new_err(error.to_string()),
         }
     }
 }
@@ -291,7 +310,10 @@ fn apply_transform(point: &[f64], transform: &[Vec<f64>]) -> Vec<f64> {
     result
 }
 
-fn numpy_linalg_error(py: Python<'_>, message: &str) -> PyErr {
+/// Raise `numpy.linalg.LinAlgError` (falling back to `ValueError` when numpy
+/// is unavailable), matching where the reference implementation lets numpy
+/// solves fail.
+pub(crate) fn numpy_linalg_error(py: Python<'_>, message: &str) -> PyErr {
     PyModule::import(py, "numpy.linalg")
         .and_then(|module| {
             let error_type = module.getattr("LinAlgError")?;
@@ -302,26 +324,26 @@ fn numpy_linalg_error(py: Python<'_>, message: &str) -> PyErr {
         .unwrap_or_else(|_| PyValueError::new_err(message.to_string()))
 }
 
-fn barycentric_alpha(vertices: &[Vec<f64>], point: &[f64]) -> Result<Vec<f64>, TriangulationError> {
-    let dim = point.len();
-    let x0 = &vertices[0];
-    let mut matrix = vec![vec![0.0; dim]; dim];
-    let mut rhs = vec![0.0; dim];
-
-    for row in 0..dim {
-        rhs[row] = point[row] - x0[row];
-        for col in 0..dim {
-            matrix[row][col] = vertices[col + 1][row] - x0[row];
-        }
+/// Positions (`0..=dim`) of the simplex vertices kept after reducing against
+/// the barycentric coordinates `alpha` (relative to vertex 0): vertices whose
+/// coordinate exceeds `eps` survive, and an empty result means the point lies
+/// outside the simplex. A single surviving position means the point coincides
+/// with that vertex.
+fn reduced_simplex_positions(alpha: &[f64], eps: f64) -> Vec<usize> {
+    let sum_alpha = alpha.iter().sum::<f64>();
+    if alpha.iter().any(|value| *value < -eps) || sum_alpha > 1.0 + eps {
+        return Vec::new();
     }
 
-    let flat: Vec<f64> = matrix.iter().flat_map(|row| row.iter().copied()).collect();
-    let mat = nalgebra::DMatrix::from_row_slice(dim, dim, &flat);
-    let rhs = nalgebra::DVector::from_column_slice(&rhs);
-    mat.lu()
-        .solve(&rhs)
-        .map(|solution| solution.iter().copied().collect())
-        .ok_or(TriangulationError::Geometry(GeometryError::SingularMatrix))
+    let mut positions: Vec<usize> = alpha
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, value)| (*value > eps).then_some(idx + 1))
+        .collect();
+    if sum_alpha < 1.0 - eps {
+        positions.insert(0, 0);
+    }
+    positions
 }
 
 fn combinations(
@@ -380,15 +402,26 @@ fn is_close(a: f64, b: f64) -> bool {
     // Symmetric variant of numpy.isclose (which scales by |b| only), so the
     // volume-conservation check cannot depend on argument order.
     let scale = a.abs().max(b.abs());
-    (a - b).abs() <= DEFAULT_EPS + 1e-5 * scale
+    (a - b).abs() <= VOLUME_CONSERVATION_ATOL + VOLUME_CONSERVATION_RTOL * scale
 }
 
+/// An N-dimensional Delaunay triangulation supporting incremental point
+/// insertion via the Bowyer-Watson algorithm. Pure Rust; the Python surface
+/// lives on [`PyTriangulation`].
 #[derive(Debug)]
 pub struct Triangulation {
+    /// Vertex coordinates, indexed by [`PointIndex`]. Vertices are never
+    /// removed; a vertex may belong to no simplex (e.g. rejected duplicates).
     pub vertices: Vec<Vec<f64>>,
+    /// All current simplices, each sorted ascending.
     pub simplices: FxHashSet<Simplex>,
+    /// For each vertex, the simplices it belongs to (inverse of
+    /// [`Self::simplices`]; see [`Self::reference_invariant`]).
     pub vertex_to_simplices: Vec<FxHashSet<Simplex>>,
+    /// Dimensionality of the vertex coordinates.
     pub dim: usize,
+    // Cache of the simplex found by the last point location, used as the
+    // start of the next walk. Interior-mutable so lookups stay `&self`.
     last_simplex: RwLock<Option<Simplex>>,
 }
 
@@ -399,12 +432,28 @@ impl Clone for Triangulation {
             simplices: self.simplices.clone(),
             vertex_to_simplices: self.vertex_to_simplices.clone(),
             dim: self.dim,
-            last_simplex: RwLock::new(self.last_simplex.read().unwrap().clone()),
+            last_simplex: RwLock::new(self.last_simplex().clone()),
         }
     }
 }
 
 impl Triangulation {
+    // The location cache is only ever replaced wholesale, so a poisoned lock
+    // (a panic while it was held) cannot leave it inconsistent; recover the
+    // value rather than propagating the panic across the FFI boundary.
+    fn last_simplex(&self) -> std::sync::RwLockReadGuard<'_, Option<Simplex>> {
+        self.last_simplex
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set_last_simplex(&self, simplex: Option<Simplex>) {
+        *self
+            .last_simplex
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = simplex;
+    }
+
     fn validate_coords(coords: &[Vec<f64>]) -> Result<usize, TriangulationError> {
         if coords.is_empty() {
             return Err(TriangulationError::Value(
@@ -481,6 +530,8 @@ impl Triangulation {
         ))
     }
 
+    /// Build a triangulation from known simplices (e.g. scipy's Delaunay
+    /// output) without running incremental insertion.
     pub fn from_simplices(
         coords: Vec<Vec<f64>>,
         simplices: impl IntoIterator<Item = Simplex>,
@@ -527,6 +578,9 @@ impl Triangulation {
         Self::from_simplices(coords, segments)
     }
 
+    /// Build a triangulation from scratch: sorted adjacency in 1D, otherwise
+    /// a seed simplex followed by incremental insertion of the remaining
+    /// points. Requires at least `dim + 1` points spanning full rank.
     pub fn new(coords: Vec<Vec<f64>>) -> Result<Self, TriangulationError> {
         let dim = Self::validate_coords(&coords)?;
         if dim == 1 {
@@ -560,7 +614,7 @@ impl Triangulation {
             }
 
             let reduced_simplex =
-                triangulation.get_reduced_simplex(&point, &actual_simplex, DEFAULT_EPS)?;
+                triangulation.get_reduced_simplex(&point, &actual_simplex, BARYCENTRIC_EPS)?;
             if reduced_simplex.is_empty() {
                 return Err(TriangulationError::Value(
                     "Point lies outside of the specified simplex.".to_string(),
@@ -575,6 +629,8 @@ impl Triangulation {
         Ok(triangulation)
     }
 
+    /// Insert a simplex (sorted automatically), keeping
+    /// [`Self::vertex_to_simplices`] in sync. No geometric checks are done.
     pub fn add_simplex(&mut self, mut simplex: Simplex) -> Result<(), TriangulationError> {
         simplex.sort_unstable();
         if simplex.len() != self.dim + 1 {
@@ -592,6 +648,7 @@ impl Triangulation {
         Ok(())
     }
 
+    /// Remove a simplex, keeping [`Self::vertex_to_simplices`] in sync.
     pub fn delete_simplex(&mut self, simplex: &[usize]) -> Result<(), TriangulationError> {
         let mut simplex = simplex.to_vec();
         simplex.sort_unstable();
@@ -604,6 +661,7 @@ impl Triangulation {
         Ok(())
     }
 
+    /// Coordinates of the given vertices, cloned in order.
     pub fn get_vertices(
         &self,
         indices: &[PointIndex],
@@ -618,38 +676,26 @@ impl Triangulation {
     fn locate_point_scan(&self, point: &[f64]) -> Result<Option<Simplex>, TriangulationError> {
         for simplex in &self.simplices {
             let vertices = self.get_vertices(simplex)?;
-            if geometry::point_in_simplex(point, &vertices, DEFAULT_EPS)? {
-                *self.last_simplex.write().unwrap() = Some(simplex.clone());
+            if geometry::point_in_simplex(point, &vertices, BARYCENTRIC_EPS)? {
+                self.set_last_simplex(Some(simplex.clone()));
                 return Ok(Some(simplex.clone()));
             }
         }
         Ok(None)
     }
 
+    /// Barycentric coordinates of `point` relative to vertices `1..=dim` of
+    /// `simplex`, without cloning the vertex coordinates.
     fn barycentric_alpha_for_simplex(
         &self,
         simplex: &[usize],
         point: &[f64],
     ) -> Result<Vec<f64>, TriangulationError> {
-        let dim = point.len();
-        let x0 = &self.vertices[simplex[0]];
-        let mut matrix = vec![vec![0.0; dim]; dim];
-        let mut rhs = vec![0.0; dim];
-
-        for row in 0..dim {
-            rhs[row] = point[row] - x0[row];
-            for col in 0..dim {
-                matrix[row][col] = self.vertices[simplex[col + 1]][row] - x0[row];
-            }
-        }
-
-        let flat: Vec<f64> = matrix.iter().flat_map(|row| row.iter().copied()).collect();
-        let mat = nalgebra::DMatrix::from_row_slice(dim, dim, &flat);
-        let rhs = nalgebra::DVector::from_column_slice(&rhs);
-        mat.lu()
-            .solve(&rhs)
-            .map(|solution| solution.iter().copied().collect())
-            .ok_or(TriangulationError::Geometry(GeometryError::SingularMatrix))
+        let vertices: Vec<&[f64]> = simplex
+            .iter()
+            .map(|&index| self.vertices[index].as_slice())
+            .collect();
+        geometry::barycentric_coordinates(&vertices, point).map_err(TriangulationError::Geometry)
     }
 
     fn next_simplex_in_walk(
@@ -669,8 +715,8 @@ impl Triangulation {
             }
         }
 
-        if worst_value >= -DEFAULT_EPS {
-            *self.last_simplex.write().unwrap() = Some(simplex.to_vec());
+        if worst_value >= -BARYCENTRIC_EPS {
+            self.set_last_simplex(Some(simplex.to_vec()));
             return Ok(Some(simplex.to_vec()));
         }
 
@@ -686,12 +732,13 @@ impl Triangulation {
         Ok(neighbours.into_iter().next())
     }
 
+    /// Find a simplex containing `point` by walking from the last located
+    /// simplex, falling back to a linear scan if the walk hits a degenerate
+    /// solve. Returns `None` when the point is outside the hull.
     pub fn locate_point(&self, point: &[f64]) -> Result<Option<Simplex>, TriangulationError> {
         self.validate_point_dim(point)?;
         let Some(mut current) = self
-            .last_simplex
-            .read()
-            .unwrap()
+            .last_simplex()
             .clone()
             .filter(|simplex| self.simplices.contains(simplex))
             .or_else(|| self.simplices.iter().next().cloned())
@@ -713,6 +760,10 @@ impl Triangulation {
         self.locate_point_scan(point)
     }
 
+    /// Reduce `simplex` to the face of it that `point` actually lies on
+    /// (with `eps` barycentric slack): the full simplex for an interior
+    /// point, a lower-dimensional face for a point on the boundary, a single
+    /// vertex for a coincident point, or empty when the point lies outside.
     pub fn get_reduced_simplex(
         &self,
         point: &[f64],
@@ -732,23 +783,14 @@ impl Triangulation {
         };
 
         let alpha = self.barycentric_alpha_for_simplex(&simplex, point)?;
-        let sum_alpha = alpha.iter().sum::<f64>();
-
-        if alpha.iter().any(|value| *value < -eps) || sum_alpha > 1.0 + eps {
-            return Ok(Vec::new());
-        }
-
-        let mut result: Vec<usize> = alpha
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, value)| (*value > eps).then_some(simplex[idx + 1]))
-            .collect();
-        if sum_alpha < 1.0 - eps {
-            result.insert(0, simplex[0]);
-        }
-        Ok(result)
+        Ok(reduced_simplex_positions(&alpha, eps)
+            .into_iter()
+            .map(|position| simplex[position])
+            .collect())
     }
 
+    /// Whether `point` lies inside the simplex given by vertex `indices`,
+    /// with `eps` barycentric slack.
     pub fn point_in_simplex(
         &self,
         point: &[f64],
@@ -759,6 +801,10 @@ impl Triangulation {
         Ok(geometry::point_in_simplex(point, &vertices, eps)?)
     }
 
+    /// All `dim`-vertex faces (default: (dim-1)-faces, i.e. facets) of either
+    /// the whole triangulation, the given `simplices`, or the simplices
+    /// touching the given `vertices` (at most one of the two filters). Faces
+    /// shared by several simplices are repeated.
     pub fn faces(
         &self,
         dim: Option<usize>,
@@ -804,6 +850,23 @@ impl Triangulation {
         }
     }
 
+    /// Count, for every (dim-1)-face of the given simplex pool (or of the
+    /// whole triangulation when `None`), how many simplices it belongs to.
+    /// In a consistent triangulation a count of 1 means a boundary face and
+    /// 2 an interior face.
+    fn face_multiplicities(
+        &self,
+        simplices: Option<&FxHashSet<Simplex>>,
+    ) -> Result<FxHashMap<Simplex, usize>, TriangulationError> {
+        let faces = self.faces(None, simplices, None)?;
+        let mut multiplicities: FxHashMap<Simplex, usize> = FxHashMap::default();
+        for face in faces {
+            *multiplicities.entry(face).or_insert(0) += 1;
+        }
+        Ok(multiplicities)
+    }
+
+    /// All simplices that contain every vertex of `face`.
     pub fn containing(&self, face: &[usize]) -> Result<FxHashSet<Simplex>, TriangulationError> {
         if face.is_empty() {
             return Ok(FxHashSet::default());
@@ -848,6 +911,8 @@ impl Triangulation {
         Ok(geometry::circumsphere(&points)?)
     }
 
+    /// Circumsphere (center, radius) of a simplex, optionally after applying
+    /// a linear `transform` to its vertices.
     pub fn circumscribed_circle(
         &self,
         simplex: &[usize],
@@ -875,9 +940,12 @@ impl Triangulation {
                 .map(|(a, b)| a - b)
                 .collect::<Vec<_>>(),
         );
-        Ok(distance < radius * (1.0 + DEFAULT_EPS))
+        Ok(distance < radius * (1.0 + CIRCUMCIRCLE_RTOL))
     }
 
+    /// Whether vertex `pt_index` lies inside the (optionally transformed)
+    /// circumsphere of `simplex`, with
+    /// [`CIRCUMCIRCLE_RTOL`] slack on the radius.
     pub fn point_in_circumcircle(
         &self,
         pt_index: usize,
@@ -896,6 +964,10 @@ impl Triangulation {
         self.point_in_circumcircle_impl(&self.vertices[pt_index], simplex, transform.as_deref())
     }
 
+    /// Re-triangulate around vertex `pt_index`: delete every simplex whose
+    /// circumsphere contains it (cascading through facet neighbours, except
+    /// in 1D) and fill the resulting hole with simplices through the vertex.
+    /// Returns `(deleted, created)` and verifies total volume is conserved.
     pub fn bowyer_watson(
         &mut self,
         pt_index: usize,
@@ -966,14 +1038,10 @@ impl Triangulation {
             }
         }
 
-        let faces = self.faces(None, Some(&bad_triangles), None)?;
-        let mut multiplicities: FxHashMap<Simplex, usize> = FxHashMap::default();
-        for face in &faces {
-            *multiplicities.entry(face.clone()).or_insert(0) += 1;
-        }
-        let hole_faces: Vec<Simplex> = faces
+        let hole_faces: Vec<Simplex> = self
+            .face_multiplicities(Some(&bad_triangles))?
             .into_iter()
-            .filter(|face| multiplicities.get(face).copied().unwrap_or_default() < 2)
+            .filter_map(|(face, count)| (count == 1).then_some(face))
             .collect();
 
         for face in hole_faces {
@@ -1011,17 +1079,16 @@ impl Triangulation {
         Ok((deleted_simplices, new_simplices))
     }
 
+    /// Connect vertex `pt_index`, which must lie outside the convex hull, to
+    /// every hull face that faces it. Returns the created simplices; errors
+    /// (and rolls back) if the vertex turns out to be inside the hull.
     pub fn extend_hull(
         &mut self,
         pt_index: usize,
     ) -> Result<FxHashSet<Simplex>, TriangulationError> {
         self.validate_vertex_index(pt_index)?;
-        let faces = self.faces(None, None, None)?;
-        let mut multiplicities: FxHashMap<Simplex, usize> = FxHashMap::default();
-        for face in &faces {
-            *multiplicities.entry(face.clone()).or_insert(0) += 1;
-        }
-        let hull_faces: Vec<Simplex> = multiplicities
+        let hull_faces: Vec<Simplex> = self
+            .face_multiplicities(None)?
             .into_iter()
             .filter_map(|(face, count)| (count == 1).then_some(face))
             .collect();
@@ -1072,6 +1139,10 @@ impl Triangulation {
         Ok(new_simplices)
     }
 
+    /// Insert a new point, locating it first unless a containing `simplex`
+    /// is supplied. Returns the `(deleted, created)` simplex sets. Errors
+    /// without modifying the triangulation when the point is already present
+    /// or lies outside the supplied simplex.
     pub fn add_point(
         &mut self,
         point: Vec<f64>,
@@ -1113,7 +1184,7 @@ impl Triangulation {
             return Ok((deleted, added));
         }
 
-        let reduced_simplex = self.get_reduced_simplex(&point, &simplex, DEFAULT_EPS)?;
+        let reduced_simplex = self.get_reduced_simplex(&point, &simplex, BARYCENTRIC_EPS)?;
         if reduced_simplex.is_empty() {
             self.vertex_to_simplices.pop();
             return Err(TriangulationError::Value(
@@ -1134,6 +1205,7 @@ impl Triangulation {
         self.bowyer_watson(pt_index, Some(actual_simplex), &transform)
     }
 
+    /// Volume of the simplex with the given vertex indices.
     pub fn volume(&self, simplex: &[usize]) -> Result<f64, TriangulationError> {
         Ok(geometry::volume(&self.get_vertices(simplex)?)?)
     }
@@ -1167,11 +1239,12 @@ impl Triangulation {
     ) -> Result<bool, TriangulationError> {
         if self.dim == 1 {
             // In 1D we only want to reject coincident endpoints, not tiny but valid intervals.
-            return Ok(self.normalized_volume(simplex)? < DEFAULT_EPS);
+            return Ok(self.normalized_volume(simplex)? < DEGENERATE_VOLUME_EPS);
         }
-        Ok(self.volume(simplex)? < DEFAULT_EPS)
+        Ok(self.volume(simplex)? < DEGENERATE_VOLUME_EPS)
     }
 
+    /// Whether the (order-insensitive) simplex is present.
     pub fn has_simplex(&self, simplex: &[usize]) -> Result<bool, TriangulationError> {
         let mut simplex = simplex.to_vec();
         simplex.sort_unstable();
@@ -1179,6 +1252,7 @@ impl Triangulation {
         Ok(self.simplices.contains(&simplex))
     }
 
+    /// The simplices containing `vertex`, by reference.
     pub fn vertex_to_simplices_for(
         &self,
         vertex: usize,
@@ -1187,6 +1261,7 @@ impl Triangulation {
         Ok(&self.vertex_to_simplices[vertex])
     }
 
+    /// Volumes of all simplices, in iteration order of [`Self::simplices`].
     pub fn volumes(&self) -> Result<Vec<f64>, TriangulationError> {
         self.simplices
             .iter()
@@ -1194,6 +1269,8 @@ impl Triangulation {
             .collect()
     }
 
+    /// Whether [`Self::simplices`] and [`Self::vertex_to_simplices`] are
+    /// mutually consistent (a bookkeeping check, not a geometric one).
     pub fn reference_invariant(&self) -> bool {
         for vertex in 0..self.vertices.len() {
             if self.vertex_to_simplices[vertex]
@@ -1214,18 +1291,16 @@ impl Triangulation {
         true
     }
 
+    /// Vertices on the convex hull (those belonging to a boundary face).
+    /// Errors when a face belongs to more than two simplices, which means
+    /// the triangulation is internally inconsistent.
     pub fn hull(&self) -> Result<FxHashSet<usize>, TriangulationError> {
-        let faces = self.faces(None, None, None)?;
-        let mut counts: FxHashMap<Simplex, usize> = FxHashMap::default();
-        for face in faces {
-            let count = counts.entry(face).or_insert(0);
-            *count += 1;
-            if *count > 2 {
-                return Err(TriangulationError::Runtime(
-                    "Broken triangulation, a (N-1)-dimensional appears in more than 2 simplices."
-                        .to_string(),
-                ));
-            }
+        let counts = self.face_multiplicities(None)?;
+        if counts.values().any(|&count| count > 2) {
+            return Err(TriangulationError::Runtime(
+                "Broken triangulation, a (N-1)-dimensional appears in more than 2 simplices."
+                    .to_string(),
+            ));
         }
 
         let mut hull = FxHashSet::default();
@@ -1238,11 +1313,16 @@ impl Triangulation {
     }
 }
 
+/// Python-facing `Triangulation`, a thin argument-parsing wrapper around the
+/// pure-Rust [`Triangulation`] core. Drop-in compatible with
+/// `adaptive.learner.triangulation.Triangulation`.
 #[pyclass(name = "Triangulation")]
 pub struct PyTriangulation {
     pub core: Triangulation,
 }
 
+/// Lazy, set-like view of the simplices (all of them, or those of one
+/// vertex) that reads triangulation state on access instead of copying it.
 #[pyclass(name = "SimplicesProxy")]
 pub struct PySimplicesProxy {
     triangulation: Py<PyTriangulation>,
@@ -1265,6 +1345,8 @@ impl PySimplicesProxy {
     }
 }
 
+/// Lazy, sequence-like view of the vertex coordinates (supports `__array__`
+/// for zero-surprise numpy conversion).
 #[pyclass(name = "VerticesProxy")]
 pub struct PyVerticesProxy {
     triangulation: Py<PyTriangulation>,
@@ -1276,6 +1358,7 @@ impl PyVerticesProxy {
     }
 }
 
+/// Lazy, sequence-like view mapping each vertex index to its simplex set.
 #[pyclass(name = "VertexToSimplicesProxy")]
 pub struct PyVertexToSimplicesProxy {
     triangulation: Py<PyTriangulation>,
@@ -1287,6 +1370,7 @@ impl PyVertexToSimplicesProxy {
     }
 }
 
+/// Iterator over a snapshot of faces/simplices as Python tuples.
 #[pyclass]
 pub struct PyFacesIter {
     items: Vec<Simplex>,
@@ -1464,8 +1548,8 @@ impl PyTriangulation {
             .map_err(TriangulationError::into_pyerr)?;
 
         let core = match scipy_delaunay_simplices(py, &parsed_coords, dim)? {
-            Some(initial) => Triangulation::from_simplices(parsed_coords.clone(), initial),
-            None => Triangulation::new(parsed_coords.clone()),
+            Some(initial) => Triangulation::from_simplices(parsed_coords, initial),
+            None => Triangulation::new(parsed_coords),
         }
         .map_err(TriangulationError::into_pyerr)?;
         Ok(Self { core })
@@ -1585,7 +1669,7 @@ impl PyTriangulation {
         }
     }
 
-    #[pyo3(signature = (point, simplex, eps=DEFAULT_EPS))]
+    #[pyo3(signature = (point, simplex, eps=BARYCENTRIC_EPS))]
     fn get_reduced_simplex(
         &self,
         py: Python<'_>,
@@ -1595,37 +1679,25 @@ impl PyTriangulation {
     ) -> PyResult<Py<PyAny>> {
         let point = parse_point(point)?;
         let simplex_signed = parse_signed_indices(simplex)?;
+        // For a full simplex the reference echoes back the caller's indices
+        // (including negative ones), so reduce positions rather than values.
         if simplex_signed.len() == self.core.dim + 1 {
             self.core
                 .validate_point_dim(&point)
                 .map_err(TriangulationError::into_pyerr)?;
             let simplex = normalize_indices(&simplex_signed, self.core.vertices.len())
                 .map_err(TriangulationError::into_pyerr)?;
-            let vertices = self
-                .core
-                .get_vertices(&simplex)
-                .map_err(TriangulationError::into_pyerr)?;
-            let alpha = match barycentric_alpha(&vertices, &point) {
+            let alpha = match self.core.barycentric_alpha_for_simplex(&simplex, &point) {
                 Ok(alpha) => alpha,
                 Err(TriangulationError::Geometry(GeometryError::SingularMatrix)) => {
                     return Err(numpy_linalg_error(py, "Singular matrix"));
                 }
                 Err(other) => return Err(other.into_pyerr()),
             };
-            let sum_alpha = alpha.iter().sum::<f64>();
-            if alpha.iter().any(|value| *value < -eps) || sum_alpha > 1.0 + eps {
-                return signed_index_list_py(py, &[]);
-            }
-
-            let mut reduced = Vec::new();
-            for (idx, value) in alpha.iter().enumerate() {
-                if *value > eps {
-                    reduced.push(simplex_signed[idx + 1]);
-                }
-            }
-            if sum_alpha < 1.0 - eps {
-                reduced.insert(0, simplex_signed[0]);
-            }
+            let reduced: Vec<isize> = reduced_simplex_positions(&alpha, eps)
+                .into_iter()
+                .map(|position| simplex_signed[position])
+                .collect();
             return signed_index_list_py(py, &reduced);
         }
 
@@ -1739,7 +1811,7 @@ impl PyTriangulation {
         Ok(PyArray2::from_vec2(py, &identity)?.into())
     }
 
-    #[pyo3(signature = (point, simplex, eps=DEFAULT_EPS))]
+    #[pyo3(signature = (point, simplex, eps=BARYCENTRIC_EPS))]
     fn point_in_simplex(
         &self,
         py: Python<'_>,

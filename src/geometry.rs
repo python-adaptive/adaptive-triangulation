@@ -1,16 +1,30 @@
+//! Pure geometric primitives: norms, determinants, barycentric coordinates,
+//! circumspheres, orientations, and simplex volumes.
+//!
+//! Nothing in this module touches Python or triangulation state, so every
+//! function here is testable in isolation. Error messages mirror the Python
+//! reference implementation in `adaptive.learner.triangulation`.
+
 use nalgebra::{DMatrix, DVector};
 use thiserror::Error;
 
+use crate::tolerances::ORIENTATION_LOG_DET_CUTOFF;
+
+/// Errors produced by the geometric primitives.
 #[derive(Debug, Error)]
 pub enum GeometryError {
+    /// Input has the wrong shape (point/vertex counts or coordinate lengths).
     #[error("{0}")]
     InvalidDimensions(String),
+    /// The vertices span a lower-dimensional space than a simplex requires.
     #[error("Provided vertices do not form a simplex")]
     DegenerateSimplex,
+    /// A linear solve hit a (numerically) singular matrix.
     #[error("Singular matrix")]
     SingularMatrix,
 }
 
+/// Euclidean norm, with unrolled 2D and 3D fast paths.
 #[inline]
 pub fn fast_norm(v: &[f64]) -> f64 {
     match v.len() {
@@ -113,6 +127,9 @@ fn solve_square(matrix: &[Vec<f64>], rhs: &[f64]) -> Result<Vec<f64>, GeometryEr
         .ok_or(GeometryError::SingularMatrix)
 }
 
+/// Rank of the matrix whose rows are `vectors`, counting singular values
+/// above `tol`. A negative `tol` selects numpy's default tolerance
+/// (`eps * max(rows, cols) * largest_singular_value`).
 pub fn matrix_rank(vectors: &[Vec<f64>], tol: f64) -> Result<usize, GeometryError> {
     if vectors.is_empty() {
         return Ok(0);
@@ -139,10 +156,38 @@ pub fn matrix_rank(vectors: &[Vec<f64>], tol: f64) -> Result<usize, GeometryErro
         .count())
 }
 
+/// [`matrix_rank`] with numpy's default tolerance.
 pub fn numpy_matrix_rank(vectors: &[Vec<f64>]) -> Result<usize, GeometryError> {
     matrix_rank(vectors, -1.0)
 }
 
+/// Barycentric coordinates of `point` with respect to vertices `1..=dim` of
+/// `simplex`; the coordinate of vertex 0 is `1 - sum(result)`.
+///
+/// Accepts any slice of coordinate slices so callers can pass either owned
+/// vertices or references into triangulation storage without cloning.
+pub fn barycentric_coordinates<P: AsRef<[f64]>>(
+    simplex: &[P],
+    point: &[f64],
+) -> Result<Vec<f64>, GeometryError> {
+    let dim = point.len();
+    let x0 = simplex[0].as_ref();
+    let mut matrix = vec![vec![0.0; dim]; dim];
+    let mut rhs = vec![0.0; dim];
+
+    for row in 0..dim {
+        rhs[row] = point[row] - x0[row];
+        for col in 0..dim {
+            matrix[row][col] = simplex[col + 1].as_ref()[row] - x0[row];
+        }
+    }
+
+    solve_square(&matrix, &rhs)
+}
+
+/// 2D point-in-triangle test via explicit barycentric formulas, with `eps`
+/// slack on the barycentric coordinates (see
+/// [`crate::tolerances::BARYCENTRIC_EPS`]).
 pub fn fast_2d_point_in_simplex(
     point: &[f64; 2],
     simplex: &[[f64; 2]; 3],
@@ -165,6 +210,8 @@ pub fn fast_2d_point_in_simplex(
     Ok(t >= -eps && s + t <= 1.0 + eps)
 }
 
+/// N-dimensional point-in-simplex test with `eps` slack on the barycentric
+/// coordinates. Dispatches to [`fast_2d_point_in_simplex`] in 2D.
 pub fn point_in_simplex(
     point: &[f64],
     simplex: &[Vec<f64>],
@@ -191,22 +238,12 @@ pub fn point_in_simplex(
         return fast_2d_point_in_simplex(&point, &simplex, eps);
     }
 
-    let x0 = &simplex[0];
-    let dim = point.len();
-    let mut matrix = vec![vec![0.0; dim]; dim];
-    let mut rhs = vec![0.0; dim];
-
-    for row in 0..dim {
-        rhs[row] = point[row] - x0[row];
-        for col in 0..dim {
-            matrix[row][col] = simplex[col + 1][row] - x0[row];
-        }
-    }
-
-    let alpha = solve_square(&matrix, &rhs)?;
+    let alpha = barycentric_coordinates(simplex, point)?;
     Ok(alpha.iter().all(|value| *value > -eps) && alpha.iter().sum::<f64>() < 1.0 + eps)
 }
 
+/// Circumcircle (center, radius) of a triangle, computed in coordinates
+/// relative to the first vertex for numerical stability.
 pub fn fast_2d_circumcircle(points: &[[f64; 2]; 3]) -> ([f64; 2], f64) {
     let [p0, p1, p2] = *points;
     let x1 = p1[0] - p0[0];
@@ -228,6 +265,8 @@ pub fn fast_2d_circumcircle(points: &[[f64; 2]; 3]) -> ([f64; 2], f64) {
     ([x + p0[0], y + p0[1]], radius)
 }
 
+/// Circumsphere (center, radius) of a tetrahedron, computed in coordinates
+/// relative to the first vertex for numerical stability.
 pub fn fast_3d_circumsphere(points: &[[f64; 3]; 4]) -> ([f64; 3], f64) {
     let [p0, p1, p2, p3] = *points;
     let x1 = p1[0] - p0[0];
@@ -258,6 +297,11 @@ pub fn fast_3d_circumsphere(points: &[[f64; 3]; 4]) -> ([f64; 3], f64) {
     ([cx + p0[0], cy + p0[1], cz + p0[2]], radius)
 }
 
+/// Circumsphere (center, radius) of an N-dimensional simplex with `dim + 1`
+/// vertices. Dispatches to the unrolled 2D/3D paths; the generic path solves
+/// in coordinates relative to the first vertex (see PR #3 — the naive
+/// `|x_i|^2 - |x_0|^2` form cancels catastrophically for small simplices far
+/// from the origin). Returns NaNs for degenerate input, matching numpy.
 pub fn circumsphere(pts: &[Vec<f64>]) -> Result<(Vec<f64>, f64), GeometryError> {
     let dim = validate_points(pts)?;
     if pts.len() != dim + 1 {
@@ -371,6 +415,10 @@ fn slogdet(matrix: &[Vec<f64>]) -> Result<(f64, f64), GeometryError> {
     Ok((sign, log_abs_det))
 }
 
+/// Sign (+1, -1, or 0) of the determinant of `face - origin`, i.e. which side
+/// of the hyperplane through `face` the point `origin` lies on. Returns 0
+/// when the log-determinant falls below
+/// [`ORIENTATION_LOG_DET_CUTOFF`].
 pub fn orientation(face: &[Vec<f64>], origin: &[f64]) -> Result<i32, GeometryError> {
     let dim = validate_points(face)?;
     if face.len() != dim || origin.len() != dim {
@@ -384,7 +432,7 @@ pub fn orientation(face: &[Vec<f64>], origin: &[f64]) -> Result<i32, GeometryErr
         .map(|point| point.iter().zip(origin).map(|(x, y)| x - y).collect())
         .collect();
     let (sign, log_det) = slogdet(&matrix)?;
-    if sign == 0.0 || log_det < -50.0 {
+    if sign == 0.0 || log_det < ORIENTATION_LOG_DET_CUTOFF {
         Ok(0)
     } else if sign.is_sign_positive() {
         Ok(1)
@@ -393,6 +441,8 @@ pub fn orientation(face: &[Vec<f64>], origin: &[f64]) -> Result<i32, GeometryErr
     }
 }
 
+/// Volume of a `dim`-simplex given its `dim + 1` vertices
+/// (`|det| / dim!` of the edge matrix).
 pub fn volume(vertices: &[Vec<f64>]) -> Result<f64, GeometryError> {
     let dim = validate_points(vertices)?;
     if vertices.len() != dim + 1 {
@@ -413,6 +463,10 @@ pub fn volume(vertices: &[Vec<f64>]) -> Result<f64, GeometryError> {
     Ok(determinant(&matrix)?.abs() / factorial(dim))
 }
 
+/// Volume of a `k`-simplex embedded in a higher-dimensional space (segment
+/// length, triangle area via Heron's formula, Cayley-Menger determinant in
+/// general). Unlike [`volume`], the number of vertices may be smaller than
+/// `dim + 1`.
 pub fn simplex_volume_in_embedding(vertices: &[Vec<f64>]) -> Result<f64, GeometryError> {
     validate_points(vertices)?;
     if vertices.len() < 2 {
