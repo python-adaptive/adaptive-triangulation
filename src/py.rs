@@ -294,10 +294,14 @@ fn scipy_delaunay_simplices(
     }
     Ok(Some(initial))
 }
+/// What `__reduce__` hands to pickle: the class and its constructor
+/// arguments `(vertices, simplices)`.
+type PickleReduction<'py> = (Bound<'py, PyAny>, (Bound<'py, PyAny>, Bound<'py, PyAny>));
+
 /// Python-facing `Triangulation`, a thin argument-parsing wrapper around the
 /// pure-Rust [`Triangulation`] core. Drop-in compatible with
 /// `adaptive.learner.triangulation.Triangulation`.
-#[pyclass(name = "Triangulation")]
+#[pyclass(name = "Triangulation", module = "adaptive_triangulation._rust")]
 pub struct PyTriangulation {
     pub core: Triangulation,
 }
@@ -569,17 +573,59 @@ impl PyVertexToSimplicesProxy {
 
 #[pymethods]
 impl PyTriangulation {
+    /// The optional `simplices` argument restores an exact prior state
+    /// (used by `__reduce__` for pickle/deepcopy) instead of triangulating
+    /// the points; the reference constructor has no such argument.
     #[new]
-    fn new(py: Python<'_>, coords: &Bound<'_, PyAny>) -> PyResult<Self> {
+    #[pyo3(signature = (coords, simplices=None))]
+    fn new(
+        py: Python<'_>,
+        coords: &Bound<'_, PyAny>,
+        simplices: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
         let parsed_coords =
             parse_points_sized(coords, "Please provide a 2-dimensional list of points")?;
         let dim = Triangulation::validate_coords(&parsed_coords)?;
+
+        if let Some(simplices) = given(simplices) {
+            let simplices = simplex_set_from_py(simplices, parsed_coords.len())?;
+            let core = Triangulation::from_simplices(parsed_coords, simplices)?;
+            return Ok(Self { core });
+        }
 
         let core = match scipy_delaunay_simplices(py, &parsed_coords, dim)? {
             Some(initial) => Triangulation::from_simplices(parsed_coords, initial),
             None => Triangulation::new(parsed_coords),
         }?;
         Ok(Self { core })
+    }
+
+    /// Pickle/copy support (the reference is a plain Python class, so
+    /// adaptive expects triangulations to survive `deepcopy` and `pickle`,
+    /// e.g. in `LearnerND._get_data`). Reconstructs through the constructor's
+    /// `simplices` argument, restoring the exact simplex set without
+    /// re-triangulating. The simplices are sorted so equal triangulations
+    /// pickle to identical bytes.
+    fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<PickleReduction<'py>> {
+        let vertices: Vec<Py<PyTuple>> = self
+            .core
+            .vertices
+            .iter()
+            .map(|point| point_tuple(py, point))
+            .collect();
+        let mut simplices: Vec<&Simplex> = self.core.simplices().collect();
+        simplices.sort_unstable();
+        let simplices: Vec<Py<PyTuple>> = simplices
+            .into_iter()
+            .map(|simplex| simplex_tuple(py, simplex))
+            .collect();
+
+        let class = py.get_type::<PyTriangulation>().into_any();
+        let args = (
+            PyList::new(py, vertices)?.into_any(),
+            PyList::new(py, simplices)?.into_any(),
+        );
+        Ok((class, args))
     }
 
     fn add_simplex(&mut self, simplex: &Bound<'_, PyAny>) -> PyResult<()> {

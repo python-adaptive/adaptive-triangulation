@@ -966,3 +966,77 @@ def test_get_vertices_passes_none_through():
     reference = reference_module.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
 
     assert tri.get_vertices([0, None, 2]) == reference.get_vertices([0, None, 2])
+
+
+def test_pickle_and_deepcopy_roundtrip():
+    import copy
+    import pickle
+
+    rng = np.random.default_rng(77)
+    coords = rng.random((12, 2))
+    tri = rust_tri.Triangulation(coords[:4])
+    for point in coords[4:]:
+        tri.add_point(point)
+    # Hand-modified state must survive too (pickle restores the exact
+    # simplex set, it does not re-triangulate).
+    simplex = next(iter(tri.simplices))
+    tri.delete_simplex(simplex)
+
+    for clone in (pickle.loads(pickle.dumps(tri)), copy.deepcopy(tri)):  # noqa: S301
+        assert clone.dim == tri.dim
+        assert_points_close(clone.vertices, tri.vertices)
+        assert as_simplex_set(clone.simplices) == as_simplex_set(tri.simplices)
+        assert as_vertex_to_simplices(clone.vertex_to_simplices) == as_vertex_to_simplices(
+            tri.vertex_to_simplices
+        )
+        assert clone.reference_invariant()
+
+    # The clone is fully functional, and mutating it leaves the original alone.
+    clone = copy.deepcopy(tri)
+    tri.add_simplex(simplex)
+    clone.add_point([2.0, 2.0])
+    assert len(clone.vertices) == len(tri.vertices) + 1
+
+
+def test_pickle_preserves_unconnected_vertices():
+    import pickle
+
+    # The trailing duplicate point stays in `vertices` without belonging to
+    # any simplex; the round-trip must not drop it.
+    tri = rust_tri.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 0.0]])
+    clone = pickle.loads(pickle.dumps(tri))  # noqa: S301
+
+    assert_points_close(clone.vertices, tri.vertices)
+    assert as_simplex_set(clone.simplices) == as_simplex_set(tri.simplices)
+
+
+def test_learnernd_deepcopy_and_get_data():
+    # LearnerND._get_data does deepcopy(self.__dict__), which includes the
+    # triangulation; learner.save()/pickling for distributed runners rely on
+    # it. Regression: the Rust class was not picklable at all.
+    import copy
+
+    from adaptive.learner import learnerND
+    from adaptive.learner.learnerND import LearnerND
+
+    original = learnerND.Triangulation
+    learnerND.Triangulation = rust_tri.Triangulation
+    try:
+        learner = LearnerND(lambda xy: xy[0] * xy[1], bounds=[(-1, 1), (-1, 1)])
+        for _ in range(30):
+            points, _ = learner.ask(1)
+            for p in points:
+                learner.tell(p, p[0] * p[1])
+
+        clone = copy.deepcopy(learner)
+        data = learner._get_data()  # noqa: SLF001
+        restored = LearnerND(lambda xy: xy[0] * xy[1], bounds=[(-1, 1), (-1, 1)])
+        restored._set_data(data)  # noqa: SLF001
+
+        for continuing in (clone, restored):
+            points, _ = continuing.ask(1)
+            for p in points:
+                continuing.tell(p, p[0] * p[1])
+            assert continuing.npoints >= learner.npoints
+    finally:
+        learnerND.Triangulation = original
