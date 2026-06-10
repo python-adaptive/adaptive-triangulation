@@ -777,6 +777,45 @@ def test_simplex_volume_in_embedding_returns_length_for_two_vertices():
     ) == pytest.approx(1.0)
 
 
+def test_simplex_volume_in_embedding_degenerate_input_is_zero():
+    # Degenerate inputs are zero-volume simplices, not errors, like the
+    # reference Cayley-Menger path: adaptive's curvature losses feed
+    # collinear/coplanar vertices whenever the function is locally flat.
+    collinear_3d = [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [2.0, 2.0, 2.0]]
+    coplanar = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]
+    coincident_3d = [[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]]
+    collinear_2d = [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]
+    for vertices in (collinear_3d, coplanar, coincident_3d, collinear_2d):
+        assert rust_tri.simplex_volume_in_embedding(vertices) == 0.0
+        # The reference lands within determinant rounding of zero (it may
+        # return sqrt of a tiny positive det rather than exactly 0.0).
+        if vertices is not coincident_3d:  # ref raises for 2 vertices
+            ref = reference_module.simplex_volume_in_embedding(vertices)
+            assert ref == pytest.approx(0.0, abs=1e-7)
+
+
+def test_simplex_volume_in_embedding_near_degenerate_matches_reference():
+    # Random nearly-collinear triangles in a 3D embedding (what a curvature
+    # loss produces near a flat region): both implementations must agree on
+    # value-or-exception, with values equal to rounding noise.
+    rng = np.random.default_rng(13)
+    for _ in range(50):
+        base = rng.random(3)
+        direction = rng.random(3)
+        ts = rng.random(3)
+        wiggle = rng.normal(0.0, 1e-12, (3, 3))
+        vertices = base + np.outer(ts, direction) + wiggle
+        try:
+            expected = reference_module.simplex_volume_in_embedding(vertices)
+        except ValueError:
+            with pytest.raises(ValueError, match="do not form a simplex"):
+                rust_tri.simplex_volume_in_embedding(vertices)
+        else:
+            assert rust_tri.simplex_volume_in_embedding(vertices) == pytest.approx(
+                expected, abs=1e-7
+            )
+
+
 def test_orientation_matches_reference_at_large_scale():
     face = [
         [-1.41794610203929e-141, 7.406648259110687e188, -5.742753819358816e155],

@@ -95,3 +95,16 @@ pub const VOLUME_CONSERVATION_RTOL: f64 = 1e-5;
 /// face's edge lengths, so faces with edges below ~`exp(-50/dim)` are always
 /// reported as degenerate. Matches the Python reference.
 pub const ORIENTATION_LOG_DET_CUTOFF: f64 = -50.0;
+
+/// Band of negative squared volumes that `simplex_volume_in_embedding`
+/// reports as exactly zero instead of an error: a squared volume in
+/// `(-EMBEDDED_VOLUME_SQ_EPS, 0.0)` is rounding noise from a degenerate
+/// (collinear/coplanar/coincident) input, which adaptive's loss functions
+/// feed it routinely and expect a 0.0 loss for. Anything more negative is
+/// a genuinely malformed input and stays an error.
+///
+/// NOT scale-invariant: the squared volume scales with the `2(n-1)`-th
+/// power of the edge lengths. Matches the Python reference, which returns
+/// 0.0 in exactly this band of its Cayley-Menger determinant and raises
+/// below it.
+pub const EMBEDDED_VOLUME_SQ_EPS: f64 = 1e-15;
