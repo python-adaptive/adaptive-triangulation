@@ -240,6 +240,56 @@ def test_construction_1d_creates_adjacent_segments():
     assert_1d_triangulation_state(tri)
 
 
+@pytest.mark.parametrize(
+    "coords",
+    [
+        np.linspace(100, 100.001, 50),
+        np.linspace(0.5, 0.5001, 30),
+        np.linspace(-1e6, -1e6 + 1e-2, 40),
+    ],
+    ids=["near-100", "near-half", "near-minus-1e6"],
+)
+def test_construction_1d_small_intervals_far_from_origin(coords):
+    # Regression: cancellation in the circumcenter solve crashed construction
+    # with an AssertionError from the volume-conservation check.
+    tri = rust_tri.Triangulation(coords.reshape(-1, 1))
+    assert_1d_triangulation_state(tri)
+    assert_1d_midpoints_locate_adjacent_segments(tri)
+
+
+def test_add_point_outside_hull_1d_far_from_origin():
+    tri = rust_tri.Triangulation([[0.0], [0.5]])
+
+    deleted, added = tri.add_point([0.5 + 1e-6])
+
+    assert as_simplex_set(deleted) == set()
+    assert as_simplex_set(added) == {(1, 2)}
+    assert_1d_triangulation_state(tri)
+
+
+def test_add_point_in_tiny_interval_far_from_origin_1d():
+    tri = rust_tri.Triangulation([[0.5], [0.5 + 1e-6]])
+
+    deleted, added = tri.add_point([0.5 + 1e-10])
+
+    assert as_simplex_set(deleted) == {(0, 1)}
+    assert as_simplex_set(added) == {(0, 2), (1, 2)}
+    assert_1d_triangulation_state(tri)
+
+
+def test_add_point_near_shared_vertex_keeps_vertex_connected_1d():
+    # Regression: the circumcircle cascade also deleted the long neighbouring
+    # interval the point is strictly outside of, orphaning the shared vertex.
+    tri = rust_tri.Triangulation([[0.0], [0.5], [0.5 + 1e-6]])
+
+    deleted, added = tri.add_point([0.5 + 1e-10], simplex=(1, 2))
+
+    assert as_simplex_set(deleted) == {(1, 2)}
+    assert as_simplex_set(added) == {(1, 3), (2, 3)}
+    assert_1d_triangulation_state(tri)
+    assert all(len(tri.vertex_to_simplices[i]) > 0 for i in range(len(tri.vertices)))
+
+
 def test_faces_containing_and_hull_match_reference():
     coords = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.4, 0.2]]
     rust = rust_tri.Triangulation(coords)
@@ -655,7 +705,8 @@ def test_tiny_triangle_point_in_simplex_matches_reference():
     assert tuple(tri.locate_point(point)) == tuple(ref_tri.locate_point(point))
 
 
-def test_simplex_volume_in_embedding_matches_reference_edge_case():
+def test_simplex_volume_in_embedding_returns_length_for_two_vertices():
+    # Deliberate divergence from the reference, which raises for 2 vertices.
     assert rust_tri.simplex_volume_in_embedding([[0.0, 0.0], [1.0, 0.0]]) == pytest.approx(1.0)
     assert rust_tri.simplex_volume_in_embedding(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]

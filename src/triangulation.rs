@@ -281,12 +281,12 @@ fn validate_transform(
 fn apply_transform(point: &[f64], transform: &[Vec<f64>]) -> Vec<f64> {
     let dim = point.len();
     let mut result = vec![0.0; dim];
-    for col in 0..dim {
+    for (col, slot) in result.iter_mut().enumerate() {
         let mut value = 0.0;
         for row in 0..dim {
             value += point[row] * transform[row][col];
         }
-        result[col] = value;
+        *slot = value;
     }
     result
 }
@@ -377,6 +377,8 @@ fn scipy_delaunay_simplices(
 }
 
 fn is_close(a: f64, b: f64) -> bool {
+    // Symmetric variant of numpy.isclose (which scales by |b| only), so the
+    // volume-conservation check cannot depend on argument order.
     let scale = a.abs().max(b.abs());
     (a - b).abs() <= DEFAULT_EPS + 1e-5 * scale
 }
@@ -853,6 +855,13 @@ impl Triangulation {
     ) -> Result<bool, TriangulationError> {
         validate_transform(transform, self.dim)?;
         self.validate_vertex_index(pt_index)?;
+        self.validate_simplex_indices(simplex)?;
+        if simplex.contains(&pt_index) {
+            // A vertex lies exactly on its own circumsphere, which the
+            // (1 + eps) tolerance counts as inside; skip the numerics so
+            // rounding in the circumcenter cannot flip the answer.
+            return Ok(true);
+        }
         self.point_in_circumcircle_impl(&self.vertices[pt_index], simplex, transform.as_deref())
     }
 
@@ -895,6 +904,15 @@ impl Triangulation {
             if self.point_in_circumcircle(pt_index, &simplex, transform)? {
                 self.delete_simplex(&simplex)?;
                 bad_triangles.insert(simplex.clone());
+
+                if self.dim == 1 {
+                    // Inserting a point into an interval never invalidates
+                    // neighbouring intervals, so there is no cascade in 1D.
+                    // Cascading on the (1 + eps) circumcircle tolerance can
+                    // delete a neighbour the point is strictly outside of,
+                    // orphaning the shared vertex.
+                    continue;
+                }
 
                 let simplex_vertices: FxHashSet<usize> = simplex.iter().copied().collect();
                 let mut neighbours = FxHashSet::default();
@@ -1685,7 +1703,7 @@ impl PyTriangulation {
     }
 
     #[getter(default_transform)]
-    fn default_transform_property<'py>(&self, py: Python<'py>) -> PyResult<Py<PyArray2<f64>>> {
+    fn default_transform_property(&self, py: Python<'_>) -> PyResult<Py<PyArray2<f64>>> {
         let identity = identity_transform(self.core.dim);
         Ok(PyArray2::from_vec2(py, &identity)?.into())
     }
@@ -1804,5 +1822,40 @@ mod tests {
             tri.simplices,
             FxHashSet::from_iter([vec![0, 2], vec![1, 2]])
         );
+    }
+
+    #[test]
+    fn one_dimensional_fine_grid_far_from_origin_constructs() {
+        // Regression: cancellation in the circumcenter solve made the
+        // volume-conservation assertion fail for small off-origin intervals.
+        let coords: Vec<Vec<f64>> = (0..50).map(|i| vec![100.0 + i as f64 * 2e-5]).collect();
+        let tri = Triangulation::new(coords).unwrap();
+
+        assert_eq!(tri.simplices.len(), 49);
+        assert_eq!(tri.hull().unwrap(), FxHashSet::from_iter([0, 49]));
+        assert!(tri.reference_invariant());
+    }
+
+    #[test]
+    fn one_dimensional_add_point_outside_hull_far_from_origin() {
+        let mut tri = Triangulation::new(vec![vec![0.0], vec![0.5]]).unwrap();
+        let (deleted, added) = tri.add_point(vec![0.5 + 1e-6], None, None).unwrap();
+
+        assert!(deleted.is_empty());
+        assert_eq!(added, FxHashSet::from_iter([vec![1, 2]]));
+    }
+
+    #[test]
+    fn one_dimensional_insertion_near_shared_vertex_keeps_vertex_connected() {
+        // Regression: the circumcircle cascade deleted the long neighbouring
+        // interval as well, orphaning the shared vertex.
+        let mut tri = Triangulation::new(vec![vec![0.0], vec![0.5], vec![0.5 + 1e-6]]).unwrap();
+        let (deleted, added) = tri
+            .add_point(vec![0.5 + 1e-10], Some(vec![1, 2]), None)
+            .unwrap();
+
+        assert_eq!(deleted, FxHashSet::from_iter([vec![1, 2]]));
+        assert_eq!(added, FxHashSet::from_iter([vec![1, 3], vec![2, 3]]));
+        assert!((0..tri.vertices.len()).all(|v| !tri.vertex_to_simplices[v].is_empty()));
     }
 }

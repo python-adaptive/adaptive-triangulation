@@ -288,20 +288,22 @@ pub fn circumsphere(pts: &[Vec<f64>]) -> Result<(Vec<f64>, f64), GeometryError> 
         return Ok((center.into_iter().collect(), radius));
     }
 
+    // Solve in coordinates relative to the first vertex: computing
+    // |x_i|^2 - |x_0|^2 directly cancels catastrophically when the simplex
+    // is small compared to its distance from the origin.
     let x0 = &pts[0];
-    let x0_sq = squared_norm(x0);
     let mut matrix = vec![vec![0.0; dim]; dim];
     let mut rhs = vec![0.0; dim];
 
     for row in 0..dim {
-        let point = &pts[row + 1];
-        rhs[row] = squared_norm(point) - x0_sq;
-        for col in 0..dim {
-            matrix[row][col] = 2.0 * (point[col] - x0[col]);
+        let translated: Vec<f64> = pts[row + 1].iter().zip(x0).map(|(a, b)| a - b).collect();
+        rhs[row] = squared_norm(&translated);
+        for (col, value) in translated.iter().enumerate() {
+            matrix[row][col] = 2.0 * value;
         }
     }
 
-    let center = match solve_square(&matrix, &rhs) {
+    let relative_center = match solve_square(&matrix, &rhs) {
         Ok(center) => center,
         Err(GeometryError::SingularMatrix) => {
             return Ok((vec![f64::NAN; dim], f64::NAN));
@@ -309,13 +311,8 @@ pub fn circumsphere(pts: &[Vec<f64>]) -> Result<(Vec<f64>, f64), GeometryError> 
         Err(err) => return Err(err),
     };
 
-    let radius = fast_norm(
-        &center
-            .iter()
-            .zip(&pts[0])
-            .map(|(x, y)| x - y)
-            .collect::<Vec<_>>(),
-    );
+    let radius = fast_norm(&relative_center);
+    let center: Vec<f64> = relative_center.iter().zip(x0).map(|(c, o)| c + o).collect();
     Ok((center, radius))
 }
 
@@ -490,5 +487,25 @@ mod tests {
         let (center, radius) = circumsphere(&[vec![0.0], vec![2.0]]).unwrap();
         assert_eq!(center, vec![1.0]);
         assert!((radius - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn circumsphere_is_accurate_for_small_simplices_far_from_origin() {
+        let (center, radius) = circumsphere(&[vec![0.5], vec![0.5 + 1e-6]]).unwrap();
+        assert!((center[0] - (0.5 + 5e-7)).abs() < 1e-15);
+        assert!((radius - 5e-7).abs() < 1e-15);
+
+        let (center, radius) = circumsphere(&[
+            vec![100.0, 100.0, 100.0, 100.0],
+            vec![100.0 + 1e-5, 100.0, 100.0, 100.0],
+            vec![100.0, 100.0 + 1e-5, 100.0, 100.0],
+            vec![100.0, 100.0, 100.0 + 1e-5, 100.0],
+            vec![100.0, 100.0, 100.0, 100.0 + 1e-5],
+        ])
+        .unwrap();
+        for coord in &center {
+            assert!((coord - (100.0 + 5e-6)).abs() < 1e-12);
+        }
+        assert!((radius - 1e-5).abs() < 1e-12);
     }
 }
