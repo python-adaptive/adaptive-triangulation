@@ -898,15 +898,13 @@ def test_neighbor_query_methods_match_reference(dim):
         assert_points_close(rust.get_vertex(index), reference.get_vertex(index))
 
     for simplex in sorted(as_simplex_set(reference.simplices)):
-        assert as_simplex_set(
-            rust.get_neighbors_from_vertices(simplex)
-        ) == as_simplex_set(reference.get_neighbors_from_vertices(simplex))
-        assert as_simplex_set(
-            rust.get_simplices_attached_to_points(simplex)
-        ) == as_simplex_set(reference.get_simplices_attached_to_points(simplex))
-        assert rust.get_opposing_vertices(simplex) == reference.get_opposing_vertices(
-            simplex
+        assert as_simplex_set(rust.get_neighbors_from_vertices(simplex)) == as_simplex_set(
+            reference.get_neighbors_from_vertices(simplex)
         )
+        assert as_simplex_set(rust.get_simplices_attached_to_points(simplex)) == as_simplex_set(
+            reference.get_simplices_attached_to_points(simplex)
+        )
+        assert rust.get_opposing_vertices(simplex) == reference.get_opposing_vertices(simplex)
         neighbors = reference.get_neighbors_from_vertices(simplex)
         assert as_simplex_set(
             rust.get_face_sharing_neighbors(neighbors, simplex)
@@ -928,11 +926,11 @@ def test_learnernd_with_neighbor_aware_loss_runs():
     # exercises get_opposing_vertices / get_simplices_attached_to_points on
     # every tell -- the part of the LearnerND surface that the default loss
     # never touches.
-    from adaptive.learner import learnerND as lnd_mod
+    from adaptive.learner import learnerND
     from adaptive.learner.learnerND import LearnerND, curvature_loss_function
 
-    original = lnd_mod.Triangulation
-    lnd_mod.Triangulation = rust_tri.Triangulation
+    original = learnerND.Triangulation
+    learnerND.Triangulation = rust_tri.Triangulation
     try:
         learner = LearnerND(
             lambda xy: xy[0] * xy[1],
@@ -944,7 +942,7 @@ def test_learnernd_with_neighbor_aware_loss_runs():
             for p in points:
                 learner.tell(p, p[0] * p[1])
     finally:
-        lnd_mod.Triangulation = original
+        learnerND.Triangulation = original
     assert learner.npoints >= 100
 
 
