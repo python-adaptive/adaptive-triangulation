@@ -6,7 +6,8 @@
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
 Fast N-dimensional Delaunay triangulation in Rust with Python bindings (PyO3).
-Drop-in replacement for [adaptive](https://github.com/python-adaptive/adaptive)'s `Triangulation` class — **30-300× faster** standalone, **~3.3×** end-to-end in `LearnerND` (where adaptive's own Python code dominates). Used automatically by adaptive ≥ 1.5 when installed.
+Drop-in replacement for [adaptive](https://github.com/python-adaptive/adaptive)'s `Triangulation` class — **30-300× faster** standalone, **~3.3×** end-to-end in `LearnerND` (where adaptive's own Python code dominates).
+Used automatically by adaptive ≥ 1.5 when installed.
 
 ## Performance
 
@@ -33,11 +34,8 @@ The end-to-end ratio is smaller than the standalone one because adaptive's own P
 
 ### Batched LearnerND APIs (not yet wired into adaptive)
 
-`simplices_containing` and `default_loss` move two of the remaining `LearnerND`
-Python hot loops into Rust. Wired in the way a future adaptive release would use
-them ([`examples/learnernd_batched_apis.py`](examples/learnernd_batched_apis.py)),
-they add **1.17×** (2D, 3000 pts) to **1.40×** (3D, 1500 pts) on top of the
-table above, while sampling identical points.
+`simplices_containing` and `default_loss` move two of the remaining `LearnerND` Python hot loops into Rust.
+Wired in the way a future adaptive release would use them ([`examples/learnernd_batched_apis.py`](examples/learnernd_batched_apis.py)), they add **1.17×** (2D, 3000 pts) to **1.40×** (3D, 1500 pts) on top of the table above, while sampling identical points.
 
 ## Installation
 
@@ -73,9 +71,7 @@ Since adaptive 1.5.0 this package is detected and used automatically — no code
 pip install "adaptive[rust]"
 ```
 
-Per learner, the backend can be selected explicitly with
-`LearnerND(..., triangulation_backend="auto" | "python" | "rust")`, or globally
-with the `ADAPTIVE_TRIANGULATION_BACKEND` environment variable.
+Per learner, the backend can be selected explicitly with `LearnerND(..., triangulation_backend="auto" | "python" | "rust")`, or globally with the `ADAPTIVE_TRIANGULATION_BACKEND` environment variable.
 
 For adaptive < 1.5.0, monkey-patch the module instead:
 
