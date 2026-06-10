@@ -1,7 +1,8 @@
 """Using adaptive-triangulation with adaptive's LearnerND.
 
 Drop-in replacement for adaptive's built-in Triangulation class,
-providing 5× speedup for LearnerND and 7× vs Learner2D at 5K points.
+providing ~3.7× end-to-end speedup for LearnerND (and ~7× vs Learner2D
+at 5K points); the triangulation work itself is 30-300× faster.
 
 Requirements:
     pip install adaptive adaptive-triangulation
