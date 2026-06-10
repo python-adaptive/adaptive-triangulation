@@ -499,8 +499,39 @@ impl Triangulation {
         Ok(triangulation)
     }
 
+    /// 1D Delaunay triangulation is the chain of adjacent points in sorted
+    /// order; building it directly avoids the O(n^2) incremental insertion.
+    fn new_1d(coords: Vec<Vec<f64>>) -> Result<Self, TriangulationError> {
+        let mut order: Vec<usize> = (0..coords.len()).collect();
+        order.sort_unstable_by(|&a, &b| coords[a][0].total_cmp(&coords[b][0]).then(a.cmp(&b)));
+        // Keep the first point among exact duplicates, matching the
+        // incremental path which skips points already in the triangulation.
+        let mut unique: Vec<usize> = Vec::with_capacity(order.len());
+        for index in order {
+            if let Some(&previous) = unique.last() {
+                if coords[index][0] == coords[previous][0] {
+                    continue;
+                }
+            }
+            unique.push(index);
+        }
+
+        let segments: Vec<Simplex> = unique
+            .windows(2)
+            .map(|pair| {
+                let mut segment = vec![pair[0], pair[1]];
+                segment.sort_unstable();
+                segment
+            })
+            .collect();
+        Self::from_simplices(coords, segments)
+    }
+
     pub fn new(coords: Vec<Vec<f64>>) -> Result<Self, TriangulationError> {
         let dim = Self::validate_coords(&coords)?;
+        if dim == 1 {
+            return Self::new_1d(coords);
+        }
         let seed_simplex = Self::find_seed_simplex(&coords, dim)?;
         let seed_vertices: FxHashSet<usize> = seed_simplex.iter().copied().collect();
 
