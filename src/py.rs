@@ -6,13 +6,13 @@
 //! Python exception types raised by `adaptive.learner.triangulation` in the
 //! same situations.
 
-use numpy::PyArray2;
+use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{
     PyAssertionError, PyIndexError, PyNotImplementedError, PyRuntimeError, PyTypeError,
     PyValueError, PyZeroDivisionError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList, PyModule, PySet, PyTuple};
+use pyo3::types::{PyAny, PyList, PyModule, PySet, PyTuple};
 use rustc_hash::FxHashSet;
 
 use crate::geometry::GeometryError;
@@ -34,6 +34,10 @@ impl TriangulationError {
 }
 
 pub(crate) fn parse_point(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
+    // Bulk-copy f64 numpy arrays instead of iterating Python objects.
+    if let Ok(array) = obj.extract::<PyReadonlyArray1<'_, f64>>() {
+        return Ok(array.as_array().to_vec());
+    }
     let Ok(iter) = obj.try_iter() else {
         return Err(PyTypeError::new_err("Expected an iterable of floats"));
     };
@@ -62,6 +66,15 @@ fn parse_points_impl(
     type_error_message: &str,
     require_sized: bool,
 ) -> PyResult<Vec<Vec<f64>>> {
+    // Bulk-copy f64 numpy arrays instead of iterating Python objects row by
+    // row; other dtypes and nested sequences take the generic path below.
+    if let Ok(array) = obj.extract::<PyReadonlyArray2<'_, f64>>() {
+        return Ok(array
+            .as_array()
+            .outer_iter()
+            .map(|row| row.to_vec())
+            .collect());
+    }
     if require_sized {
         ensure_sized(obj, type_error_message)?;
     }
@@ -215,14 +228,6 @@ pub(crate) fn simplex_set_py<'a>(
         .map(|simplex| simplex_tuple(py, simplex).into())
         .collect();
     Ok(PySet::new(py, &tuples)?.into())
-}
-
-pub(crate) fn point_list_py(py: Python<'_>, points: &[Vec<f64>]) -> PyResult<Py<PyAny>> {
-    let tuples: Vec<Py<PyAny>> = points
-        .iter()
-        .map(|point| point_tuple(py, point).into())
-        .collect();
-    Ok(PyList::new(py, tuples)?.into())
 }
 
 pub(crate) fn index_list_py(py: Python<'_>, indices: &[usize]) -> PyResult<Py<PyAny>> {
@@ -536,22 +541,16 @@ impl PyVerticesProxy {
         dtype: Option<&Bound<'_, PyAny>>,
         copy: Option<bool>,
     ) -> PyResult<Py<PyAny>> {
+        // The snapshot is always a freshly allocated array, so the `copy`
+        // argument needs no special handling. Build it directly instead of
+        // round-tripping through a list of Python tuples.
+        let _ = copy;
         let triangulation = self.triangulation.bind(py).borrow();
-        let vertices = point_list_py(py, &triangulation.core.vertices)?;
-        let numpy = PyModule::import(py, "numpy")?;
-        let kwargs = PyDict::new(py);
-        if let Some(dtype) = dtype {
-            kwargs.set_item("dtype", dtype)?;
+        let array = PyArray2::from_vec2(py, &triangulation.core.vertices)?;
+        match dtype {
+            Some(dtype) if !dtype.is_none() => Ok(array.call_method1("astype", (dtype,))?.unbind()),
+            _ => Ok(array.into_any().unbind()),
         }
-        let array = if copy == Some(false) {
-            numpy.call_method("asarray", (vertices,), Some(&kwargs))?
-        } else {
-            if let Some(copy) = copy {
-                kwargs.set_item("copy", copy)?;
-            }
-            numpy.call_method("array", (vertices,), Some(&kwargs))?
-        };
-        Ok(array.into())
     }
 }
 
