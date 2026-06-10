@@ -294,6 +294,10 @@ fn scipy_delaunay_simplices(
     }
     Ok(Some(initial))
 }
+/// What `__reduce__` hands to pickle: the class and its constructor
+/// arguments `(vertices, simplices)`.
+type PickleReduction<'py> = (Bound<'py, PyAny>, (Bound<'py, PyAny>, Bound<'py, PyAny>));
+
 /// Python-facing `Triangulation`, a thin argument-parsing wrapper around the
 /// pure-Rust [`Triangulation`] core. Drop-in compatible with
 /// `adaptive.learner.triangulation.Triangulation`.
@@ -600,28 +604,28 @@ impl PyTriangulation {
     /// adaptive expects triangulations to survive `deepcopy` and `pickle`,
     /// e.g. in `LearnerND._get_data`). Reconstructs through the constructor's
     /// `simplices` argument, restoring the exact simplex set without
-    /// re-triangulating.
-    fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
-        let class = py.get_type::<PyTriangulation>();
-        let vertices: Vec<Py<PyAny>> = self
+    /// re-triangulating. The simplices are sorted so equal triangulations
+    /// pickle to identical bytes.
+    fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<PickleReduction<'py>> {
+        let vertices: Vec<Py<PyTuple>> = self
             .core
             .vertices
             .iter()
-            .map(|point| point_tuple(py, point).into())
+            .map(|point| point_tuple(py, point))
             .collect();
-        let simplices: Vec<Py<PyAny>> = self
-            .core
-            .simplices()
-            .map(|simplex| simplex_tuple(py, simplex).into())
+        let mut simplices: Vec<&Simplex> = self.core.simplices().collect();
+        simplices.sort_unstable();
+        let simplices: Vec<Py<PyTuple>> = simplices
+            .into_iter()
+            .map(|simplex| simplex_tuple(py, simplex))
             .collect();
-        let args = PyTuple::new(
-            py,
-            [
-                PyList::new(py, vertices)?.into_any(),
-                PyList::new(py, simplices)?.into_any(),
-            ],
-        )?;
-        Ok((class.unbind().into_any(), args.unbind().into_any()))
+
+        let class = py.get_type::<PyTriangulation>().into_any();
+        let args = (
+            PyList::new(py, vertices)?.into_any(),
+            PyList::new(py, simplices)?.into_any(),
+        );
+        Ok((class, args))
     }
 
     fn add_simplex(&mut self, simplex: &Bound<'_, PyAny>) -> PyResult<()> {
