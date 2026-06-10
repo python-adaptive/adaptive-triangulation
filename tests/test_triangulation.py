@@ -982,7 +982,7 @@ def test_pickle_and_deepcopy_roundtrip():
     simplex = next(iter(tri.simplices))
     tri.delete_simplex(simplex)
 
-    for clone in (pickle.loads(pickle.dumps(tri)), copy.deepcopy(tri)):
+    for clone in (pickle.loads(pickle.dumps(tri)), copy.deepcopy(tri)):  # noqa: S301
         assert clone.dim == tri.dim
         assert_points_close(clone.vertices, tri.vertices)
         assert as_simplex_set(clone.simplices) == as_simplex_set(tri.simplices)
@@ -1004,7 +1004,7 @@ def test_pickle_preserves_unconnected_vertices():
     # The trailing duplicate point stays in `vertices` without belonging to
     # any simplex; the round-trip must not drop it.
     tri = rust_tri.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 0.0]])
-    clone = pickle.loads(pickle.dumps(tri))
+    clone = pickle.loads(pickle.dumps(tri))  # noqa: S301
 
     assert_points_close(clone.vertices, tri.vertices)
     assert as_simplex_set(clone.simplices) == as_simplex_set(tri.simplices)
@@ -1029,9 +1029,9 @@ def test_learnernd_deepcopy_and_get_data():
                 learner.tell(p, p[0] * p[1])
 
         clone = copy.deepcopy(learner)
-        data = learner._get_data()
+        data = learner._get_data()  # noqa: SLF001
         restored = LearnerND(lambda xy: xy[0] * xy[1], bounds=[(-1, 1), (-1, 1)])
-        restored._set_data(data)
+        restored._set_data(data)  # noqa: SLF001
 
         for continuing in (clone, restored):
             points, _ = continuing.ask(1)
