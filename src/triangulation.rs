@@ -968,6 +968,8 @@ impl Triangulation {
     /// circumsphere contains it (cascading through facet neighbours, except
     /// in 1D) and fill the resulting hole with simplices through the vertex.
     /// Returns `(deleted, created)` and verifies total volume is conserved.
+    /// Errors without mutating anything when the insertion would strand a
+    /// cavity vertex, i.e. the point is numerically a duplicate of it.
     pub fn bowyer_watson(
         &mut self,
         pt_index: usize,
@@ -980,10 +982,12 @@ impl Triangulation {
             self.validate_simplex_indices(simplex)?;
         }
 
+        // Collect the cavity (every simplex whose circumsphere contains the
+        // point, cascading through facet neighbours) without mutating, so
+        // that pathological insertions can still be rejected cleanly below.
         let mut queue = VecDeque::new();
         let mut queued = FxHashSet::default();
-        let mut done_simplices = FxHashSet::default();
-        let mut bad_triangles = FxHashSet::default();
+        let mut bad_triangles: FxHashSet<Simplex> = FxHashSet::default();
 
         if let Some(simplex) = containing_simplex {
             queued.insert(simplex.clone());
@@ -997,23 +1001,16 @@ impl Triangulation {
         }
 
         while let Some(simplex) = queue.pop_front() {
-            if !done_simplices.insert(simplex.clone()) {
-                continue;
-            }
             if !self.simplices.contains(&simplex) {
                 continue;
             }
 
             if self.point_in_circumcircle(pt_index, &simplex, transform)? {
-                self.delete_simplex(&simplex)?;
                 bad_triangles.insert(simplex.clone());
 
                 if self.dim == 1 {
                     // Inserting a point into an interval never invalidates
                     // neighbouring intervals, so there is no cascade in 1D.
-                    // Cascading on the (1 + eps) circumcircle tolerance can
-                    // delete a neighbour the point is strictly outside of,
-                    // orphaning the shared vertex.
                     continue;
                 }
 
@@ -1024,9 +1021,6 @@ impl Triangulation {
                 }
 
                 for neighbour in neighbours {
-                    if done_simplices.contains(&neighbour) {
-                        continue;
-                    }
                     let shared = neighbour
                         .iter()
                         .filter(|vertex| simplex_vertices.contains(vertex))
@@ -1044,6 +1038,7 @@ impl Triangulation {
             .filter_map(|(face, count)| (count == 1).then_some(face))
             .collect();
 
+        let mut candidates: Vec<Simplex> = Vec::new();
         for face in hole_faces {
             if face.contains(&pt_index) {
                 continue;
@@ -1055,6 +1050,33 @@ impl Triangulation {
             if self.simplex_is_numerically_degenerate(&simplex)? {
                 continue;
             }
+            candidates.push(simplex);
+        }
+
+        // A cavity vertex that would lose all of its simplices without
+        // being reconnected means the point is numerically indistinguishable
+        // from that vertex (it sits within the circumcircle slack of every
+        // simplex around it). Reject the insertion before mutating anything
+        // rather than orphaning the vertex and corrupting the triangulation.
+        let candidate_vertices: FxHashSet<usize> = candidates.iter().flatten().copied().collect();
+        for &vertex in bad_triangles.iter().flatten() {
+            if vertex == pt_index || candidate_vertices.contains(&vertex) {
+                continue;
+            }
+            if self.vertex_to_simplices[vertex]
+                .iter()
+                .all(|simplex| bad_triangles.contains(simplex))
+            {
+                return Err(TriangulationError::Value(
+                    "Point already in triangulation.".to_string(),
+                ));
+            }
+        }
+
+        for simplex in &bad_triangles {
+            self.delete_simplex(simplex)?;
+        }
+        for simplex in candidates {
             self.add_simplex(simplex)?;
         }
 
@@ -1171,7 +1193,20 @@ impl Triangulation {
                 }
             };
             let (deleted_simplices, added_simplices) =
-                self.bowyer_watson(pt_index, None, &transform)?;
+                match self.bowyer_watson(pt_index, None, &transform) {
+                    Ok(result) => result,
+                    // Value errors are raised before bowyer_watson mutates,
+                    // so only the hull extension needs rolling back.
+                    Err(err @ TriangulationError::Value(_)) => {
+                        for simplex in self.vertex_to_simplices[pt_index].clone() {
+                            self.delete_simplex(&simplex)?;
+                        }
+                        self.vertex_to_simplices.pop();
+                        self.vertices.pop();
+                        return Err(err);
+                    }
+                    Err(err) => return Err(err),
+                };
 
             let deleted: FxHashSet<Simplex> = deleted_simplices
                 .difference(&temporary_simplices)
@@ -1202,7 +1237,16 @@ impl Triangulation {
 
         let pt_index = self.vertices.len();
         self.vertices.push(point);
-        self.bowyer_watson(pt_index, Some(actual_simplex), &transform)
+        match self.bowyer_watson(pt_index, Some(actual_simplex), &transform) {
+            // Value errors are raised before bowyer_watson mutates, so only
+            // the freshly pushed vertex needs rolling back.
+            Err(err @ TriangulationError::Value(_)) => {
+                self.vertex_to_simplices.pop();
+                self.vertices.pop();
+                Err(err)
+            }
+            other => other,
+        }
     }
 
     /// Volume of the simplex with the given vertex indices.
@@ -1237,11 +1281,16 @@ impl Triangulation {
         &self,
         simplex: &[usize],
     ) -> Result<bool, TriangulationError> {
-        if self.dim == 1 {
-            // In 1D we only want to reject coincident endpoints, not tiny but valid intervals.
-            return Ok(self.normalized_volume(simplex)? < DEGENERATE_VOLUME_EPS);
-        }
-        Ok(self.volume(simplex)? < DEGENERATE_VOLUME_EPS)
+        // Drop a candidate only when its volume is negligible in BOTH
+        // senses: absolutely tiny, so removing it cannot leave a material
+        // hole (this is the Python reference's criterion), AND flat relative
+        // to its own extent. Either test alone is wrong in some regime: the
+        // absolute cutoff alone empties finely refined or small-coordinate
+        // meshes whose well-shaped simplices all sit below it, while the
+        // flatness cutoff alone deletes large-but-flat simplices whose
+        // volume the cavity genuinely needs (breaking volume conservation).
+        Ok(self.volume(simplex)? < DEGENERATE_VOLUME_EPS
+            && self.normalized_volume(simplex)? < DEGENERATE_VOLUME_EPS)
     }
 
     /// Whether the (order-insensitive) simplex is present.
@@ -1946,6 +1995,55 @@ mod tests {
 
         assert!(deleted.is_empty());
         assert_eq!(added, FxHashSet::from_iter([vec![1, 2]]));
+    }
+
+    #[test]
+    fn two_dimensional_small_scale_insertion_keeps_mesh() {
+        // Regression: the absolute degenerate-volume cutoff dropped every
+        // candidate simplex below 1e-8 volume, emptying the mesh.
+        let mut tri = Triangulation::from_simplices(
+            vec![
+                vec![0.0, 0.0],
+                vec![1e-4, 0.0],
+                vec![0.0, 1e-4],
+                vec![1e-4, 1e-4],
+            ],
+            vec![vec![0, 1, 3], vec![0, 2, 3]],
+        )
+        .unwrap();
+
+        let (deleted, added) = tri.add_point(vec![5e-5, 6e-5], None, None).unwrap();
+
+        assert_eq!(deleted.len(), 2);
+        assert_eq!(added.len(), 4);
+        assert_eq!(tri.simplices.len(), 4);
+        assert!((0..tri.vertices.len()).all(|v| !tri.vertex_to_simplices[v].is_empty()));
+    }
+
+    #[test]
+    fn two_dimensional_near_duplicate_insertion_is_rejected_without_mutation() {
+        // Regression: a point within the circumcircle slack of every simplex
+        // around an existing vertex orphaned that vertex.
+        let mut tri = Triangulation::new(vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![0.5, 1.0],
+            vec![0.5, 0.5],
+            vec![0.5 + 1e-6, 0.5],
+            vec![0.5, 0.5 + 1e-6],
+        ])
+        .unwrap();
+        let simplices_before = tri.simplices.clone();
+        let n_vertices_before = tri.vertices.len();
+
+        let err = tri
+            .add_point(vec![0.5 + 2e-10, 0.5 + 2e-10], None, None)
+            .unwrap_err();
+
+        assert!(matches!(err, TriangulationError::Value(_)));
+        assert_eq!(tri.simplices, simplices_before);
+        assert_eq!(tri.vertices.len(), n_vertices_before);
+        assert!(tri.reference_invariant());
     }
 
     #[test]
