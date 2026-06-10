@@ -953,6 +953,7 @@ impl Triangulation {
                 }
             }
         }
+        let seed_ids: Vec<SimplexId> = queue.iter().copied().collect();
 
         while let Some(id) = queue.pop_front() {
             let simplex = self.simplex_by_id(id);
@@ -980,29 +981,58 @@ impl Triangulation {
             }
         }
 
-        let bad_simplices: Vec<Simplex> = bad_ids
-            .iter()
-            .map(|&id| self.simplex_by_id(id).clone())
-            .collect();
+        let (mut bad_simplices, mut candidates) = self.cavity_candidates(pt_index, &bad_ids)?;
+        let (mut deleted_simplices, mut new_simplices, mut point_connected) =
+            self.cavity_outcome(pt_index, &bad_simplices, &candidates);
 
-        let hole_faces: Vec<Simplex> = Self::facet_multiplicities(bad_simplices.iter())
-            .into_iter()
-            .filter_map(|(face, count)| (count == 1).then_some(face))
-            .collect();
-
-        let mut candidates: Vec<Simplex> = Vec::new();
-        for face in hole_faces {
-            if face.contains(&pt_index) {
-                continue;
+        let mut old_vol = self.summed_volume(&deleted_simplices)?;
+        let mut new_vol = self.summed_volume(&new_simplices)?;
+        // The cavity is unusable when re-triangulating it would not cover
+        // the volume it frees, or when it would leave the point connected
+        // to nothing: either an empty cavity (the circumsphere test falsely
+        // excluded even the simplex the point lies in) or a cavity that
+        // swallows every simplex of the point while producing no candidates
+        // (its total volume can sit below the conservation check's absolute
+        // tolerance, making that check vacuous). Both happen when sliver
+        // simplices feed the floating-point circumsphere test cancellation
+        // noise; see src/tolerances.rs.
+        if !is_close(old_vol, new_vol) || !point_connected {
+            // Repair: in 2D/3D rebuild the cavity with exact insphere
+            // predicates — the exact Delaunay cavity is connected,
+            // void-free, and star-shaped around the point, so filling it
+            // conserves volume by construction (provided the surrounding
+            // mesh itself is still consistent). Where no exact predicate
+            // exists (4D+), fall back to shrinking the cavity until every
+            // hole face is visible from the point. Nothing has been mutated
+            // yet, so when even the repaired cavity fails validation the
+            // insertion is rejected with the triangulation untouched; the
+            // Python reference instead mutates first and corrupts its
+            // state.
+            if let Some(exact_cavity) =
+                self.rebuild_cavity_exact(pt_index, &seed_ids, transform.as_deref())?
+            {
+                bad_ids = exact_cavity;
+            } else {
+                self.shrink_cavity_to_star(pt_index, &mut bad_ids, &seed_ids)?;
             }
-            let mut simplex = face;
-            simplex.push(pt_index);
-            simplex.sort_unstable();
+            (bad_simplices, candidates) = self.cavity_candidates(pt_index, &bad_ids)?;
+            (deleted_simplices, new_simplices, point_connected) =
+                self.cavity_outcome(pt_index, &bad_simplices, &candidates);
+            old_vol = self.summed_volume(&deleted_simplices)?;
+            new_vol = self.summed_volume(&new_simplices)?;
 
-            if self.simplex_is_numerically_degenerate(&simplex)? {
-                continue;
+            if !is_close(old_vol, new_vol) {
+                return Err(TriangulationError::Assertion(format!(
+                    "{old_vol} !== {new_vol}"
+                )));
             }
-            candidates.push(simplex);
+            if !point_connected {
+                // Even the repaired cavity cannot connect the point: it is
+                // numerically indistinguishable from existing structure.
+                return Err(TriangulationError::Value(
+                    "Point already in triangulation.".to_string(),
+                ));
+            }
         }
 
         // A cavity vertex that would lose all of its simplices without
@@ -1032,29 +1062,227 @@ impl Triangulation {
             self.add_simplex(simplex)?;
         }
 
-        let new_triangles: FxHashSet<Simplex> = self.vertex_to_ids[pt_index]
+        Ok((deleted_simplices, new_simplices))
+    }
+
+    /// The cavity simplices (cloned out of the slab) and the candidate
+    /// simplices that would fill the cavity's hole: one per hole face (a
+    /// facet belonging to exactly one cavity simplex) that does not contain
+    /// the point, joined with the point, minus numerically degenerate ones.
+    fn cavity_candidates(
+        &self,
+        pt_index: usize,
+        bad_ids: &FxHashSet<SimplexId>,
+    ) -> Result<(Vec<Simplex>, Vec<Simplex>), TriangulationError> {
+        let bad_simplices: Vec<Simplex> = bad_ids
             .iter()
             .map(|&id| self.simplex_by_id(id).clone())
             .collect();
-        let bad_triangles: FxHashSet<Simplex> = bad_simplices.into_iter().collect();
-        let deleted_simplices: FxHashSet<Simplex> =
-            bad_triangles.difference(&new_triangles).cloned().collect();
-        let new_simplices: FxHashSet<Simplex> =
-            new_triangles.difference(&bad_triangles).cloned().collect();
 
-        let old_vol = deleted_simplices.iter().try_fold(0.0, |acc, simplex| {
-            Ok::<f64, TriangulationError>(acc + self.volume(simplex)?)
-        })?;
-        let new_vol = new_simplices.iter().try_fold(0.0, |acc, simplex| {
-            Ok::<f64, TriangulationError>(acc + self.volume(simplex)?)
-        })?;
-        if !is_close(old_vol, new_vol) {
-            return Err(TriangulationError::Assertion(format!(
-                "{old_vol} !== {new_vol}"
-            )));
+        let hole_faces: Vec<Simplex> = Self::facet_multiplicities(bad_simplices.iter())
+            .into_iter()
+            .filter_map(|(face, count)| (count == 1).then_some(face))
+            .collect();
+
+        let mut candidates: Vec<Simplex> = Vec::new();
+        for face in hole_faces {
+            if face.contains(&pt_index) {
+                continue;
+            }
+            let mut simplex = face;
+            simplex.push(pt_index);
+            simplex.sort_unstable();
+
+            if self.simplex_is_numerically_degenerate(&simplex)? {
+                continue;
+            }
+            candidates.push(simplex);
+        }
+        Ok((bad_simplices, candidates))
+    }
+
+    /// The `(deleted, created, point_connected)` outcome that deleting the
+    /// cavity and adding the candidates *would* produce, computed without
+    /// mutating anything: the point's simplices afterwards are its current
+    /// ones minus the cavity plus the candidates (`point_connected` reports
+    /// whether that set is non-empty), and a simplex both deleted and
+    /// recreated cancels out of the result.
+    fn cavity_outcome(
+        &self,
+        pt_index: usize,
+        bad_simplices: &[Simplex],
+        candidates: &[Simplex],
+    ) -> (FxHashSet<Simplex>, FxHashSet<Simplex>, bool) {
+        let bad_set: FxHashSet<&Simplex> = bad_simplices.iter().collect();
+        let mut new_triangles: FxHashSet<Simplex> = self.vertex_to_ids[pt_index]
+            .iter()
+            .map(|&id| self.simplex_by_id(id))
+            .filter(|simplex| !bad_set.contains(simplex))
+            .cloned()
+            .collect();
+        new_triangles.extend(candidates.iter().cloned());
+        let point_connected = !new_triangles.is_empty();
+
+        let deleted: FxHashSet<Simplex> = bad_simplices
+            .iter()
+            .filter(|simplex| !new_triangles.contains(*simplex))
+            .cloned()
+            .collect();
+        let created: FxHashSet<Simplex> = new_triangles
+            .into_iter()
+            .filter(|simplex| !bad_set.contains(simplex))
+            .collect();
+        (deleted, created, point_connected)
+    }
+
+    /// Total volume of `simplices`, using adaptive-precision determinants
+    /// (in 2D/3D) so the conservation check compares true volumes instead of
+    /// cancellation noise when the cavity contains slivers.
+    fn summed_volume(&self, simplices: &FxHashSet<Simplex>) -> Result<f64, TriangulationError> {
+        simplices.iter().try_fold(0.0, |acc, simplex| {
+            Ok::<f64, TriangulationError>(
+                acc + geometry::precise_volume(&self.get_vertices(simplex)?)?,
+            )
+        })
+    }
+
+    /// Rebuild the cavity with exact in-circumsphere predicates (2D/3D
+    /// only; `None` elsewhere): cascade through facet neighbours from the
+    /// seeds, keeping the seeds themselves (the point lies in or on them)
+    /// plus every simplex whose circumsphere strictly contains the point.
+    /// The exact Delaunay cavity is connected, void-free, and star-shaped
+    /// around the point, so filling it from the point conserves volume even
+    /// when slivers fooled the floating-point tests that assembled the
+    /// original cavity.
+    fn rebuild_cavity_exact(
+        &self,
+        pt_index: usize,
+        seed_ids: &[SimplexId],
+        transform: Option<&[Vec<f64>]>,
+    ) -> Result<Option<FxHashSet<SimplexId>>, TriangulationError> {
+        if self.dim != 2 && self.dim != 3 {
+            return Ok(None);
+        }
+        let point = match transform {
+            Some(matrix) => apply_transform(&self.vertices[pt_index], matrix),
+            None => self.vertices[pt_index].clone(),
+        };
+
+        let mut cavity: FxHashSet<SimplexId> = FxHashSet::default();
+        let mut examined: FxHashSet<SimplexId> = FxHashSet::default();
+        let mut queue: VecDeque<SimplexId> = VecDeque::new();
+        for &seed in seed_ids {
+            if self.id_is_live(seed) && examined.insert(seed) {
+                cavity.insert(seed);
+                queue.push_back(seed);
+            }
         }
 
-        Ok((deleted_simplices, new_simplices))
+        while let Some(id) = queue.pop_front() {
+            let simplex = self.simplex_by_id(id);
+            for skip in 0..simplex.len() {
+                let Some(incident) = self.facets.get(&facet_excluding(simplex, skip)) else {
+                    continue;
+                };
+                for &neighbour in incident {
+                    if neighbour == id || !examined.insert(neighbour) {
+                        continue;
+                    }
+                    let points = self.simplex_points(self.simplex_by_id(neighbour), transform)?;
+                    if geometry::robust_in_circumsphere(&points, &point)?.unwrap_or(false) {
+                        cavity.insert(neighbour);
+                        queue.push_back(neighbour);
+                    }
+                }
+            }
+        }
+        Ok(Some(cavity))
+    }
+
+    /// Shrink the cavity until it is star-shaped as seen from `pt_index`:
+    /// every hole face not containing the point must be strictly visible
+    /// from it, i.e. the point lies on the same side of the face as the
+    /// cavity simplex owning it. Owners of invisible faces are evicted and
+    /// the hole boundary recomputed until no violation remains. Visibility
+    /// uses exact orientation predicates in 2D/3D
+    /// ([`geometry::robust_orientation`]), so a sliver cannot fool it.
+    fn shrink_cavity_to_star(
+        &self,
+        pt_index: usize,
+        bad_ids: &mut FxHashSet<SimplexId>,
+        seed_ids: &[SimplexId],
+    ) -> Result<(), TriangulationError> {
+        let point = &self.vertices[pt_index];
+        self.prune_to_seed_component(bad_ids, seed_ids);
+        loop {
+            // Hole face -> (multiplicity within the cavity, owning cavity
+            // simplex, its vertex opposite the face).
+            let mut faces: FxHashMap<Simplex, (usize, SimplexId, usize)> = FxHashMap::default();
+            for &id in bad_ids.iter() {
+                let simplex = self.simplex_by_id(id);
+                for skip in 0..simplex.len() {
+                    faces
+                        .entry(facet_excluding(simplex, skip))
+                        .and_modify(|entry| entry.0 += 1)
+                        .or_insert((1, id, simplex[skip]));
+                }
+            }
+
+            let mut evicted = false;
+            for (face, &(count, owner, opposite)) in &faces {
+                if count != 1 || face.contains(&pt_index) || !bad_ids.contains(&owner) {
+                    continue;
+                }
+                let face_points = self.get_vertices(face)?;
+                let side_of_point = geometry::robust_orientation(&face_points, point)?;
+                let side_of_cavity =
+                    geometry::robust_orientation(&face_points, &self.vertices[opposite])?;
+                if side_of_point == 0 || side_of_point != side_of_cavity {
+                    bad_ids.remove(&owner);
+                    evicted = true;
+                }
+            }
+            if !evicted || bad_ids.is_empty() {
+                return Ok(());
+            }
+            // Evictions can split the cavity; fragments no longer reachable
+            // from the seeds cannot be filled from the point.
+            self.prune_to_seed_component(bad_ids, seed_ids);
+            if bad_ids.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Restrict the cavity to the component reachable from the seed
+    /// simplices through shared facets. Disconnected fragments are
+    /// circumsphere false positives on slivers; keeping them makes the hole
+    /// unfillable from the point.
+    fn prune_to_seed_component(&self, bad_ids: &mut FxHashSet<SimplexId>, seed_ids: &[SimplexId]) {
+        let mut reachable: FxHashSet<SimplexId> = FxHashSet::default();
+        let mut queue: VecDeque<SimplexId> = VecDeque::new();
+        for &seed in seed_ids {
+            if bad_ids.contains(&seed) && reachable.insert(seed) {
+                queue.push_back(seed);
+            }
+        }
+        while let Some(id) = queue.pop_front() {
+            let simplex = self.simplex_by_id(id);
+            for skip in 0..simplex.len() {
+                let Some(incident) = self.facets.get(&facet_excluding(simplex, skip)) else {
+                    continue;
+                };
+                for &neighbour in incident {
+                    if neighbour != id
+                        && bad_ids.contains(&neighbour)
+                        && reachable.insert(neighbour)
+                    {
+                        queue.push_back(neighbour);
+                    }
+                }
+            }
+        }
+        *bad_ids = reachable;
     }
 
     /// Connect vertex `pt_index`, which must lie outside the convex hull, to
@@ -1146,24 +1374,26 @@ impl Triangulation {
                     return Err(err);
                 }
             };
-            let (deleted_simplices, added_simplices) =
-                match self.bowyer_watson(pt_index, None, &transform) {
-                    Ok(result) => result,
-                    // Value errors are raised before bowyer_watson mutates,
-                    // so only the hull extension needs rolling back.
-                    Err(err @ TriangulationError::Value(_)) => {
-                        let attached: Vec<Simplex> = self.vertex_to_ids[pt_index]
-                            .iter()
-                            .map(|&id| self.simplex_by_id(id).clone())
-                            .collect();
-                        for simplex in attached {
-                            self.delete_simplex(&simplex)?;
-                        }
-                        self.pop_vertex();
-                        return Err(err);
+            let (deleted_simplices, added_simplices) = match self
+                .bowyer_watson(pt_index, None, &transform)
+            {
+                Ok(result) => result,
+                // Value and assertion errors are raised before
+                // bowyer_watson mutates, so only the hull extension
+                // needs rolling back.
+                Err(err @ (TriangulationError::Value(_) | TriangulationError::Assertion(_))) => {
+                    let attached: Vec<Simplex> = self.vertex_to_ids[pt_index]
+                        .iter()
+                        .map(|&id| self.simplex_by_id(id).clone())
+                        .collect();
+                    for simplex in attached {
+                        self.delete_simplex(&simplex)?;
                     }
-                    Err(err) => return Err(err),
-                };
+                    self.pop_vertex();
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            };
 
             let deleted: FxHashSet<Simplex> = deleted_simplices
                 .difference(&temporary_simplices)
@@ -1192,9 +1422,9 @@ impl Triangulation {
 
         let pt_index = self.add_vertex(point);
         match self.bowyer_watson(pt_index, Some(actual_simplex), &transform) {
-            // Value errors are raised before bowyer_watson mutates, so only
-            // the freshly pushed vertex needs rolling back.
-            Err(err @ TriangulationError::Value(_)) => {
+            // Value and assertion errors are raised before bowyer_watson
+            // mutates, so only the freshly pushed vertex needs rolling back.
+            Err(err @ (TriangulationError::Value(_) | TriangulationError::Assertion(_))) => {
                 self.pop_vertex();
                 Err(err)
             }

@@ -441,6 +441,197 @@ pub fn orientation(face: &[Vec<f64>], origin: &[f64]) -> Result<i32, GeometryErr
     }
 }
 
+/// Like [`orientation`], but exact in 2D and 3D: the sign is computed with
+/// Shewchuk's adaptive-precision predicates (via the `robust` crate), so it
+/// is correct even for slivers whose floating-point determinant rounds to
+/// the wrong side of zero. Higher dimensions (and 1D) fall back to
+/// [`orientation`], whose answer near zero is best-effort.
+///
+/// Not a drop-in replacement for [`orientation`] in reference-compatible
+/// code paths: the reference applies [`ORIENTATION_LOG_DET_CUTOFF`], which
+/// reports tiny-but-nonzero determinants as 0 while this reports their true
+/// sign. Use it where geometric truth matters more than bug compatibility
+/// (e.g. cavity repair).
+pub fn robust_orientation(face: &[Vec<f64>], origin: &[f64]) -> Result<i32, GeometryError> {
+    let dim = validate_points(face)?;
+    if face.len() != dim || origin.len() != dim {
+        return Err(GeometryError::InvalidDimensions(
+            "Face and origin dimensions do not match".to_string(),
+        ));
+    }
+
+    match dim {
+        // orient2d(a, b, c) = det [[a - c], [b - c]], exactly the
+        // determinant `orientation` takes the sign of.
+        2 => {
+            let det = robust::orient2d(
+                robust::Coord {
+                    x: face[0][0],
+                    y: face[0][1],
+                },
+                robust::Coord {
+                    x: face[1][0],
+                    y: face[1][1],
+                },
+                robust::Coord {
+                    x: origin[0],
+                    y: origin[1],
+                },
+            );
+            Ok(if det > 0.0 {
+                1
+            } else if det < 0.0 {
+                -1
+            } else {
+                0
+            })
+        }
+        // orient3d(a, b, c, d) = det [[a - d], [b - d], [c - d]], exactly the
+        // determinant `orientation` takes the sign of.
+        3 => {
+            let coord = |point: &[f64]| robust::Coord3D {
+                x: point[0],
+                y: point[1],
+                z: point[2],
+            };
+            let det = robust::orient3d(
+                coord(&face[0]),
+                coord(&face[1]),
+                coord(&face[2]),
+                coord(origin),
+            );
+            Ok(if det > 0.0 {
+                1
+            } else if det < 0.0 {
+                -1
+            } else {
+                0
+            })
+        }
+        _ => orientation(face, origin),
+    }
+}
+
+/// Whether `point` lies strictly inside the circumsphere of `simplex`,
+/// decided exactly with Shewchuk's adaptive-precision incircle/insphere
+/// predicates. Returns `None` for dimensions other than 2 and 3 (no exact
+/// predicate available). A degenerate simplex (zero orientation) has no
+/// finite circumsphere and reports `false`, matching the NaN-radius
+/// convention of [`circumsphere`].
+///
+/// Note the deliberate difference from the reference's tolerance test
+/// (`distance < radius * (1 + CIRCUMCIRCLE_RTOL)`): this is strict
+/// containment with no slack. Use it where geometric truth matters more
+/// than bug compatibility (e.g. cavity repair).
+pub fn robust_in_circumsphere(
+    simplex: &[Vec<f64>],
+    point: &[f64],
+) -> Result<Option<bool>, GeometryError> {
+    let dim = validate_points(simplex)?;
+    if simplex.len() != dim + 1 || point.len() != dim {
+        return Err(GeometryError::InvalidDimensions(format!(
+            "Expected {} points for a {}-dimensional simplex",
+            dim + 1,
+            dim
+        )));
+    }
+
+    match dim {
+        // incircle's sign follows the triangle's orientation; multiplying
+        // by orient2d makes the test orientation-independent.
+        2 => {
+            let coord = |p: &[f64]| robust::Coord { x: p[0], y: p[1] };
+            let orient =
+                robust::orient2d(coord(&simplex[0]), coord(&simplex[1]), coord(&simplex[2]));
+            if orient == 0.0 {
+                return Ok(Some(false));
+            }
+            let incircle = robust::incircle(
+                coord(&simplex[0]),
+                coord(&simplex[1]),
+                coord(&simplex[2]),
+                coord(point),
+            );
+            Ok(Some(incircle * orient > 0.0))
+        }
+        3 => {
+            let coord = |p: &[f64]| robust::Coord3D {
+                x: p[0],
+                y: p[1],
+                z: p[2],
+            };
+            let orient = robust::orient3d(
+                coord(&simplex[0]),
+                coord(&simplex[1]),
+                coord(&simplex[2]),
+                coord(&simplex[3]),
+            );
+            if orient == 0.0 {
+                return Ok(Some(false));
+            }
+            let insphere = robust::insphere(
+                coord(&simplex[0]),
+                coord(&simplex[1]),
+                coord(&simplex[2]),
+                coord(&simplex[3]),
+                coord(point),
+            );
+            Ok(Some(insphere * orient > 0.0))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Like [`volume`], but computed with adaptive-precision determinants in 2D
+/// and 3D (the value of Shewchuk's orientation predicate is the exact edge
+/// determinant, evaluated to machine relative accuracy), so cancellation
+/// cannot corrupt the result for sliver simplices. Higher dimensions fall
+/// back to [`volume`].
+///
+/// Not used for reference-compatible answers (the reference computes plain
+/// floating-point determinants); use it where an accurate value matters,
+/// e.g. the volume-conservation check in Bowyer-Watson.
+pub fn precise_volume(vertices: &[Vec<f64>]) -> Result<f64, GeometryError> {
+    let dim = validate_points(vertices)?;
+    if vertices.len() != dim + 1 {
+        return Err(GeometryError::InvalidDimensions(format!(
+            "Expected {} points for a {}-dimensional simplex",
+            dim + 1,
+            dim
+        )));
+    }
+
+    match dim {
+        2 => {
+            let coord = |point: &[f64]| robust::Coord {
+                x: point[0],
+                y: point[1],
+            };
+            let det = robust::orient2d(
+                coord(&vertices[1]),
+                coord(&vertices[2]),
+                coord(&vertices[0]),
+            );
+            Ok(det.abs() / 2.0)
+        }
+        3 => {
+            let coord = |point: &[f64]| robust::Coord3D {
+                x: point[0],
+                y: point[1],
+                z: point[2],
+            };
+            let det = robust::orient3d(
+                coord(&vertices[1]),
+                coord(&vertices[2]),
+                coord(&vertices[3]),
+                coord(&vertices[0]),
+            );
+            Ok(det.abs() / 6.0)
+        }
+        _ => volume(vertices),
+    }
+}
+
 /// Volume of a `dim`-simplex given its `dim + 1` vertices
 /// (`|det| / dim!` of the edge matrix).
 pub fn volume(vertices: &[Vec<f64>]) -> Result<f64, GeometryError> {
@@ -541,6 +732,56 @@ mod tests {
         let (center, radius) = circumsphere(&[vec![0.0], vec![2.0]]).unwrap();
         assert_eq!(center, vec![1.0]);
         assert!((radius - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn robust_orientation_matches_orientation_on_well_conditioned_input() {
+        let faces_2d = [
+            (vec![vec![1.0, 0.0], vec![0.0, 1.0]], vec![0.1, 0.1]),
+            (vec![vec![0.0, 1.0], vec![1.0, 0.0]], vec![0.1, 0.1]),
+            (vec![vec![3.0, -2.0], vec![-1.5, 4.0]], vec![10.0, -7.0]),
+        ];
+        for (face, origin) in &faces_2d {
+            assert_eq!(
+                robust_orientation(face, origin).unwrap(),
+                orientation(face, origin).unwrap()
+            );
+        }
+
+        let faces_3d = [
+            (
+                vec![
+                    vec![1.0, 0.0, 0.0],
+                    vec![0.0, 1.0, 0.0],
+                    vec![0.0, 0.0, 1.0],
+                ],
+                vec![0.0, 0.0, 0.0],
+            ),
+            (
+                vec![
+                    vec![2.0, 1.0, -1.0],
+                    vec![-1.0, 3.0, 0.5],
+                    vec![0.5, -2.0, 4.0],
+                ],
+                vec![5.0, 5.0, 5.0],
+            ),
+        ];
+        for (face, origin) in &faces_3d {
+            assert_eq!(
+                robust_orientation(face, origin).unwrap(),
+                orientation(face, origin).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn robust_orientation_resolves_signs_below_the_log_det_cutoff() {
+        // A sliver whose determinant is far below exp(-50): the slogdet-based
+        // test gives up and reports 0, the exact predicate knows the sign.
+        let face = vec![vec![1e-12, 0.0], vec![0.0, 1e-12]];
+        let origin = vec![1e-13, 1e-13];
+        assert_eq!(orientation(&face, &origin).unwrap(), 0);
+        assert_eq!(robust_orientation(&face, &origin).unwrap(), 1);
     }
 
     #[test]
