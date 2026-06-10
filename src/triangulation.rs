@@ -822,6 +822,89 @@ impl Triangulation {
             .collect())
     }
 
+    /// All simplices that share at least one vertex with the given vertex
+    /// set (the union of the vertices' simplex sets).
+    pub fn neighbors_from_vertices(
+        &self,
+        indices: &[usize],
+    ) -> Result<FxHashSet<Simplex>, TriangulationError> {
+        self.validate_simplex_indices(indices)?;
+        let mut neighbors = FxHashSet::default();
+        for &vertex in indices {
+            neighbors.extend(self.simplices_of(vertex).cloned());
+        }
+        Ok(neighbors)
+    }
+
+    /// All simplices sharing exactly `dim` vertices (a whole facet) with the
+    /// given vertex set. For a full simplex these are its facet neighbours;
+    /// the simplex itself (sharing dim+1 vertices) is excluded.
+    pub fn simplices_attached_to_points(
+        &self,
+        indices: &[usize],
+    ) -> Result<FxHashSet<Simplex>, TriangulationError> {
+        self.validate_simplex_indices(indices)?;
+        let index_set: FxHashSet<usize> = indices.iter().copied().collect();
+        let mut seen: FxHashSet<SimplexId> = FxHashSet::default();
+        let mut attached = FxHashSet::default();
+        for &vertex in indices {
+            for &id in &self.vertex_to_ids[vertex] {
+                if !seen.insert(id) {
+                    continue;
+                }
+                let simplex = self.simplex_by_id(id);
+                let shared = simplex
+                    .iter()
+                    .filter(|vertex| index_set.contains(vertex))
+                    .count();
+                if shared == self.dim {
+                    attached.insert(simplex.clone());
+                }
+            }
+        }
+        Ok(attached)
+    }
+
+    /// For each vertex of `simplex` (in the given order), the vertex of the
+    /// facet neighbour on the other side of the opposite facet, or `None`
+    /// when that facet lies on the hull. Errors when the simplex is not part
+    /// of the triangulation.
+    pub fn opposing_vertices(
+        &self,
+        simplex: &[usize],
+    ) -> Result<Vec<Option<PointIndex>>, TriangulationError> {
+        let mut sorted = simplex.to_vec();
+        sorted.sort_unstable();
+        self.validate_simplex_indices(&sorted)?;
+        let Some(&own_id) = self.ids.get(&sorted) else {
+            return Err(TriangulationError::Value(
+                "Provided simplex is not part of the triangulation".to_string(),
+            ));
+        };
+
+        simplex
+            .iter()
+            .map(|&vertex| {
+                let position = sorted
+                    .iter()
+                    .position(|&other| other == vertex)
+                    .expect("vertex comes from the simplex itself");
+                let facet = facet_excluding(&sorted, position);
+                let neighbour = self
+                    .facets
+                    .get(&facet)
+                    .and_then(|incident| incident.iter().copied().find(|&id| id != own_id));
+                Ok(neighbour.map(|id| {
+                    self.simplex_by_id(id)
+                        .iter()
+                        .copied()
+                        .find(|other| !sorted.contains(other))
+                        .expect("facet neighbour has exactly one vertex outside the simplex")
+                }))
+            })
+            .collect()
+    }
+
     fn simplex_points(
         &self,
         simplex: &[usize],
