@@ -1,6 +1,6 @@
 [package]
 name = "adaptive-triangulation"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Fast N-dimensional Delaunay triangulation with incremental point insertion (Bowyer-Watson)"
 license = "BSD-3-Clause"
