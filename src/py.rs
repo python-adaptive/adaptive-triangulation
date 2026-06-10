@@ -315,6 +315,16 @@ impl PySimplicesProxy {
             vertex: Some(vertex),
         }
     }
+
+    /// The current simplices as a real Python set, for the set-operator
+    /// protocol below.
+    fn snapshot_set(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let triangulation = self.triangulation.bind(py).borrow();
+        match self.vertex {
+            Some(vertex) => simplex_set_py(py, triangulation.core.simplices_of(vertex)),
+            None => simplex_set_py(py, triangulation.core.simplices()),
+        }
+    }
 }
 
 /// Lazy, sequence-like view of the vertex coordinates (supports `__array__`
@@ -405,6 +415,66 @@ impl PySimplicesProxy {
             Some(vertex) => triangulation.core.vertex_simplex_count(vertex),
             None => triangulation.core.num_simplices(),
         }
+    }
+
+    // The reference exposes `simplices` as a real set, so callers combine it
+    // with sets freely (adaptive does `... - tri.simplices`). Delegate the
+    // binary set operators to a snapshot set, in both operand orders.
+
+    fn __sub__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Ok(self
+            .snapshot_set(py)?
+            .bind(py)
+            .call_method1("__sub__", (other,))?
+            .unbind())
+    }
+
+    fn __rsub__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Ok(other
+            .call_method1("__sub__", (self.snapshot_set(py)?,))?
+            .unbind())
+    }
+
+    fn __and__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Ok(self
+            .snapshot_set(py)?
+            .bind(py)
+            .call_method1("__and__", (other,))?
+            .unbind())
+    }
+
+    fn __rand__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Ok(other
+            .call_method1("__and__", (self.snapshot_set(py)?,))?
+            .unbind())
+    }
+
+    fn __or__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Ok(self
+            .snapshot_set(py)?
+            .bind(py)
+            .call_method1("__or__", (other,))?
+            .unbind())
+    }
+
+    fn __ror__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Ok(other
+            .call_method1("__or__", (self.snapshot_set(py)?,))?
+            .unbind())
+    }
+
+    fn __xor__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Ok(self
+            .snapshot_set(py)?
+            .bind(py)
+            .call_method1("__xor__", (other,))?
+            .unbind())
+    }
+
+    fn __rxor__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Ok(other
+            .call_method1("__xor__", (self.snapshot_set(py)?,))?
+            .unbind())
     }
 }
 
@@ -609,20 +679,32 @@ impl PyTriangulation {
         self.core.dim
     }
 
+    /// `None` entries pass through as `None`, like the reference (which maps
+    /// every index through `get_vertex`); adaptive relies on this when it
+    /// feeds the result of `get_opposing_vertices` straight back in.
     #[pyo3(name = "get_vertices")]
     fn get_vertices_method(
         &self,
         py: Python<'_>,
         indices: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let indices = ordered_indices_from_py(indices, self.core.vertices.len())?;
-        point_list_py(
-            py,
-            &self
-                .core
-                .get_vertices(&indices)
-                .map_err(TriangulationError::into_pyerr)?,
-        )
+        let Ok(iter) = indices.try_iter() else {
+            return Err(PyTypeError::new_err(
+                "Expected an iterable of vertex indices",
+            ));
+        };
+        let mut items: Vec<Py<PyAny>> = Vec::new();
+        for item in iter {
+            let item = item?;
+            if item.is_none() {
+                items.push(py.None());
+                continue;
+            }
+            let index = normalize_index(item.extract::<isize>()?, self.core.vertices.len())
+                .map_err(TriangulationError::into_pyerr)?;
+            items.push(point_tuple(py, &self.core.vertices[index]).into());
+        }
+        Ok(PyList::new(py, items)?.into())
     }
 
     fn locate_point(&self, py: Python<'_>, point: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
@@ -822,6 +904,83 @@ impl PyTriangulation {
             .bowyer_watson(pt_index, containing_simplex, &transform)
             .map_err(TriangulationError::into_pyerr)?;
         Ok((simplex_set_py(py, &deleted)?, simplex_set_py(py, &added)?))
+    }
+
+    #[pyo3(signature = (index))]
+    fn get_vertex(&self, py: Python<'_>, index: Option<isize>) -> PyResult<Py<PyAny>> {
+        match index {
+            None => Ok(py.None()),
+            Some(index) => {
+                let index = normalize_index(index, self.core.vertices.len())
+                    .map_err(TriangulationError::into_pyerr)?;
+                Ok(point_tuple(py, &self.core.vertices[index]).into())
+            }
+        }
+    }
+
+    fn get_neighbors_from_vertices(
+        &self,
+        py: Python<'_>,
+        simplex: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let indices = ordered_indices_from_py(simplex, self.core.vertices.len())?;
+        let neighbors = self
+            .core
+            .neighbors_from_vertices(&indices)
+            .map_err(TriangulationError::into_pyerr)?;
+        simplex_set_py(py, &neighbors)
+    }
+
+    fn get_simplices_attached_to_points(
+        &self,
+        py: Python<'_>,
+        indices: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let indices = ordered_indices_from_py(indices, self.core.vertices.len())?;
+        let attached = self
+            .core
+            .simplices_attached_to_points(&indices)
+            .map_err(TriangulationError::into_pyerr)?;
+        simplex_set_py(py, &attached)
+    }
+
+    fn get_opposing_vertices(
+        &self,
+        py: Python<'_>,
+        simplex: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyTuple>> {
+        let simplex = ordered_indices_from_py(simplex, self.core.vertices.len())?;
+        let opposing = self
+            .core
+            .opposing_vertices(&simplex)
+            .map_err(TriangulationError::into_pyerr)?;
+        Ok(PyTuple::new(py, opposing)?.into())
+    }
+
+    /// Keep only the simplices sharing a whole face with `simplex`. A pure
+    /// set filter on the arguments, like the reference implementation; the
+    /// simplices are not required to be part of the triangulation.
+    fn get_face_sharing_neighbors(
+        &self,
+        py: Python<'_>,
+        neighbors: &Bound<'_, PyAny>,
+        simplex: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let neighbors = simplex_set_from_py(neighbors, self.core.vertices.len())?;
+        let simplex = ordered_indices_from_py(simplex, self.core.vertices.len())?;
+        let simplex_set: FxHashSet<usize> = simplex.iter().copied().collect();
+        let sharing: FxHashSet<Simplex> = neighbors
+            .into_iter()
+            .filter(|neighbor| {
+                let shared: FxHashSet<usize> = neighbor
+                    .iter()
+                    .copied()
+                    .filter(|vertex| simplex_set.contains(vertex))
+                    .collect();
+                shared.len() == self.core.dim
+            })
+            .collect();
+        simplex_set_py(py, &sharing)
     }
 
     fn vertex_invariant(&self, _vertex: usize) -> PyResult<bool> {

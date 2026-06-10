@@ -881,3 +881,90 @@ def test_random_cross_validation_1d():
 def test_public_bowyer_watson_is_exposed():
     tri = rust_tri.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
     assert hasattr(tri, "bowyer_watson")
+
+
+@pytest.mark.parametrize("dim", [2, 3])
+def test_neighbor_query_methods_match_reference(dim):
+    rng = np.random.default_rng(31337 + dim)
+    coords = rng.random((10, dim))
+    rust = rust_tri.Triangulation(coords[: dim + 1])
+    reference = reference_module.Triangulation(coords[: dim + 1])
+    for point in coords[dim + 1 :]:
+        rust.add_point(point)
+        reference.add_point(point)
+
+    assert rust.get_vertex(None) is None
+    for index in (0, len(coords) - 1, -1):
+        assert_points_close(rust.get_vertex(index), reference.get_vertex(index))
+
+    for simplex in sorted(as_simplex_set(reference.simplices)):
+        assert as_simplex_set(
+            rust.get_neighbors_from_vertices(simplex)
+        ) == as_simplex_set(reference.get_neighbors_from_vertices(simplex))
+        assert as_simplex_set(
+            rust.get_simplices_attached_to_points(simplex)
+        ) == as_simplex_set(reference.get_simplices_attached_to_points(simplex))
+        assert rust.get_opposing_vertices(simplex) == reference.get_opposing_vertices(
+            simplex
+        )
+        neighbors = reference.get_neighbors_from_vertices(simplex)
+        assert as_simplex_set(
+            rust.get_face_sharing_neighbors(neighbors, simplex)
+        ) == as_simplex_set(reference.get_face_sharing_neighbors(neighbors, simplex))
+
+
+def test_get_opposing_vertices_rejects_unknown_simplex():
+    rust = rust_tri.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    reference = reference_module.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+
+    assert_same_exception_type_name(
+        lambda: rust.get_opposing_vertices((0, 1, 2)),
+        lambda: reference.get_opposing_vertices((0, 1, 2)),
+    )
+
+
+def test_learnernd_with_neighbor_aware_loss_runs():
+    # curvature_loss_function produces a loss with nth_neighbors=1, which
+    # exercises get_opposing_vertices / get_simplices_attached_to_points on
+    # every tell -- the part of the LearnerND surface that the default loss
+    # never touches.
+    from adaptive.learner import learnerND as lnd_mod
+    from adaptive.learner.learnerND import LearnerND, curvature_loss_function
+
+    original = lnd_mod.Triangulation
+    lnd_mod.Triangulation = rust_tri.Triangulation
+    try:
+        learner = LearnerND(
+            lambda xy: xy[0] * xy[1],
+            bounds=[(-1, 1), (-1, 1)],
+            loss_per_simplex=curvature_loss_function(),
+        )
+        for _ in range(100):
+            points, _ = learner.ask(1)
+            for p in points:
+                learner.tell(p, p[0] * p[1])
+    finally:
+        lnd_mod.Triangulation = original
+    assert learner.npoints >= 100
+
+
+def test_simplices_proxy_supports_set_operators():
+    tri = rust_tri.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    simplices = as_simplex_set(tri.simplices)
+    one = {next(iter(simplices))}
+
+    assert tri.simplices - one == simplices - one
+    assert one - tri.simplices == set()
+    assert tri.simplices & one == one
+    assert one & tri.simplices == one
+    assert tri.simplices | one == simplices
+    assert one | tri.simplices == simplices
+    assert tri.simplices ^ one == simplices - one
+    assert one ^ tri.simplices == simplices - one
+
+
+def test_get_vertices_passes_none_through():
+    tri = rust_tri.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    reference = reference_module.Triangulation([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+
+    assert tri.get_vertices([0, None, 2]) == reference.get_vertices([0, None, 2])
