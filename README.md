@@ -92,6 +92,10 @@ tri.circumscribed_circle(simplex)      # → (center, radius)
 tri.volume(simplex)                    # Simplex volume
 tri.volumes()                          # All simplex volumes
 tri.point_in_simplex(point, simplex)   # Containment test
+tri.simplices_containing(point)        # All simplices containing a point, in one call
+                                       # instead of a point_in_simplex loop; pass a known
+                                       # containing simplex via simplex=... to skip the
+                                       # locate step, or restrict with candidates=...
 tri.point_in_circumcircle(pt, simplex) # Circumcircle test
 tri.bowyer_watson(pt_index)            # Direct Bowyer-Watson
 tri.get_opposing_vertices(simplex)     # Facet neighbours' opposite vertices
@@ -111,6 +115,8 @@ from adaptive_triangulation import (
     point_in_simplex,          # Containment test
     volume,                    # Simplex volume
     simplex_volume_in_embedding,  # Volume in embedding space
+    default_loss,              # LearnerND's default loss (embedded simplex volume),
+                               # signature-compatible with loss_per_simplex
     orientation,               # Face orientation
 )
 ```

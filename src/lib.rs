@@ -8,6 +8,7 @@ pub mod py;
 pub mod tolerances;
 pub mod triangulation;
 
+use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyValueError, PyZeroDivisionError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule, PyTuple};
@@ -47,6 +48,7 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_fast_norm, m)?)?;
     m.add_function(wrap_pyfunction!(py_volume, m)?)?;
     m.add_function(wrap_pyfunction!(py_simplex_volume_in_embedding, m)?)?;
+    m.add_function(wrap_pyfunction!(py_default_loss, m)?)?;
     m.add_function(wrap_pyfunction!(py_orientation, m)?)?;
 
     Ok(())
@@ -174,6 +176,54 @@ fn py_simplex_volume_in_embedding(vertices: &Bound<'_, PyAny>) -> PyResult<f64> 
     let vertices = parse_points_sized(vertices, "Please provide a 2-dimensional list of points")?;
     geom::simplex_volume_in_embedding(&vertices)
         .map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
+/// Parse per-vertex function values: one scalar per vertex or one vector per
+/// vertex, with bulk-copy fast paths for 1-D and 2-D f64 numpy arrays (what
+/// `LearnerND._compute_loss` passes after scaling).
+fn parse_values(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<f64>>> {
+    if let Ok(array) = obj.extract::<PyReadonlyArray1<'_, f64>>() {
+        return Ok(array.as_array().iter().map(|&value| vec![value]).collect());
+    }
+    if let Ok(array) = obj.extract::<PyReadonlyArray2<'_, f64>>() {
+        return Ok(array
+            .as_array()
+            .outer_iter()
+            .map(|row| row.to_vec())
+            .collect());
+    }
+    let Ok(iter) = obj.try_iter() else {
+        return Err(PyValueError::new_err(
+            "Expected one scalar or one vector of floats per vertex",
+        ));
+    };
+    let mut values = Vec::new();
+    for item in iter {
+        let item = item?;
+        match item.extract::<f64>() {
+            Ok(value) => values.push(vec![value]),
+            Err(_) => values.push(parse_point(&item)?),
+        }
+    }
+    Ok(values)
+}
+
+/// The default `LearnerND` loss: the volume of the simplex embedded in
+/// (input + output)-dimensional space, where each vertex is extended with
+/// its function value(s). Signature-compatible with adaptive's
+/// `loss_per_simplex` functions; `value_scale` is accepted and unused, like
+/// the reference (`values` arrive already scaled).
+#[pyfunction]
+#[pyo3(name = "default_loss", signature = (simplex, values, value_scale=None))]
+fn py_default_loss(
+    simplex: &Bound<'_, PyAny>,
+    values: &Bound<'_, PyAny>,
+    value_scale: Option<&Bound<'_, PyAny>>,
+) -> PyResult<f64> {
+    let _ = value_scale;
+    let simplex = parse_points_sized(simplex, "Please provide a 2-dimensional list of points")?;
+    let values = parse_values(values)?;
+    geom::default_loss(&simplex, &values).map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
 #[pyfunction]

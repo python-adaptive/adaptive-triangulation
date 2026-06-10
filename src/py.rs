@@ -33,6 +33,22 @@ impl From<TriangulationError> for PyErr {
     }
 }
 
+/// Error mapping for point-in-simplex checks: the reference implementation
+/// divides by the simplex volume and solves a linear system, so degenerate
+/// simplices raise `ZeroDivisionError` and singular solves raise
+/// `numpy.linalg.LinAlgError`.
+fn point_in_simplex_error(py: Python<'_>, error: TriangulationError) -> PyErr {
+    match error {
+        TriangulationError::Geometry(GeometryError::DegenerateSimplex) => {
+            PyZeroDivisionError::new_err("division by zero")
+        }
+        TriangulationError::Geometry(GeometryError::SingularMatrix) => {
+            numpy_linalg_error(py, "Singular matrix")
+        }
+        other => other.into(),
+    }
+}
+
 pub(crate) fn parse_point(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
     // Bulk-copy f64 numpy arrays instead of iterating Python objects.
     if let Ok(array) = obj.extract::<PyReadonlyArray1<'_, f64>>() {
@@ -875,16 +891,51 @@ impl PyTriangulation {
     ) -> PyResult<bool> {
         let point = parse_point(point)?;
         let simplex = ordered_indices_from_py(simplex, self.core.vertices.len())?;
-        match self.core.point_in_simplex(&point, &simplex, eps) {
-            Ok(result) => Ok(result),
-            Err(TriangulationError::Geometry(GeometryError::DegenerateSimplex)) => {
-                Err(PyZeroDivisionError::new_err("division by zero"))
+        self.core
+            .point_in_simplex(&point, &simplex, eps)
+            .map_err(|error| point_in_simplex_error(py, error))
+    }
+
+    /// All simplices containing `point`, as a sorted list of tuples: among
+    /// `candidates` when given, otherwise found from a simplex containing
+    /// the point (the `simplex` hint when it holds the point, else
+    /// `locate_point`). One call replaces a Python-side loop of
+    /// `point_in_simplex` checks (the hot loop in adaptive's
+    /// `LearnerND.tell_pending`, whose `simplex` argument maps onto the
+    /// hint).
+    #[pyo3(signature = (point, simplex=None, candidates=None, eps=BARYCENTRIC_EPS))]
+    fn simplices_containing(
+        &self,
+        py: Python<'_>,
+        point: &Bound<'_, PyAny>,
+        simplex: Option<&Bound<'_, PyAny>>,
+        candidates: Option<&Bound<'_, PyAny>>,
+        eps: f64,
+    ) -> PyResult<Py<PyAny>> {
+        let point = parse_point(point)?;
+        let hint = match given(simplex) {
+            None => None,
+            Some(value) => Some(canonical_simplex_from_py(value, self.core.vertices.len())?),
+        };
+        let candidates = match given(candidates) {
+            None => None,
+            Some(value) => {
+                let mut canonical = FxHashSet::default();
+                for simplex in parse_signed_simplex_set(value)? {
+                    canonical.insert(canonicalize_simplex(&simplex, self.core.vertices.len())?);
+                }
+                Some(canonical.into_iter().collect())
             }
-            Err(TriangulationError::Geometry(GeometryError::SingularMatrix)) => {
-                Err(numpy_linalg_error(py, "Singular matrix"))
-            }
-            Err(other) => Err(other.into()),
-        }
+        };
+        let containing = self
+            .core
+            .simplices_containing_point(&point, candidates, hint.as_deref(), eps)
+            .map_err(|error| point_in_simplex_error(py, error))?;
+        let items: Vec<Py<PyAny>> = containing
+            .iter()
+            .map(|simplex| simplex_tuple(py, simplex).into())
+            .collect();
+        Ok(PyList::new(py, items)?.into())
     }
 
     #[pyo3(signature = (pt_index, containing_simplex=None, transform=None))]
