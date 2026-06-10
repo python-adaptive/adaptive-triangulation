@@ -4,6 +4,7 @@
 //! documented in [`tolerances`].
 
 pub mod geometry;
+pub mod py;
 pub mod tolerances;
 pub mod triangulation;
 
@@ -12,7 +13,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule, PyTuple};
 
 use crate::geometry as geom;
-use crate::triangulation::{
+use crate::py::{
     numpy_linalg_error, parse_point, parse_points_sized, point_tuple, PyFacesIter,
     PySimplicesProxy, PyTriangulation, PyVertexToSimplicesIter, PyVertexToSimplicesProxy,
     PyVerticesIter, PyVerticesProxy,
