@@ -1,4 +1,10 @@
+//! Rust backend for `adaptive_triangulation`: a drop-in replacement for
+//! `adaptive.learner.triangulation` (see [`triangulation`] for the class and
+//! [`geometry`] for the free functions), with the numerical tolerance policy
+//! documented in [`tolerances`].
+
 pub mod geometry;
+pub mod tolerances;
 pub mod triangulation;
 
 use pyo3::exceptions::{PyValueError, PyZeroDivisionError};
@@ -7,20 +13,10 @@ use pyo3::types::{PyAny, PyModule, PyTuple};
 
 use crate::geometry as geom;
 use crate::triangulation::{
-    parse_point, parse_points_sized, point_tuple, PyFacesIter, PySimplicesProxy, PyTriangulation,
-    PyVertexToSimplicesIter, PyVertexToSimplicesProxy, PyVerticesIter, PyVerticesProxy,
+    numpy_linalg_error, parse_point, parse_points_sized, point_tuple, PyFacesIter,
+    PySimplicesProxy, PyTriangulation, PyVertexToSimplicesIter, PyVertexToSimplicesProxy,
+    PyVerticesIter, PyVerticesProxy,
 };
-
-fn numpy_linalg_error(py: Python<'_>, message: &str) -> PyErr {
-    PyModule::import(py, "numpy.linalg")
-        .and_then(|module| {
-            let error_type = module.getattr("LinAlgError")?;
-            let args = PyTuple::new(py, [message]).unwrap();
-            let value = error_type.call1(args)?;
-            Ok(PyErr::from_value(value))
-        })
-        .unwrap_or_else(|_| PyValueError::new_err(message.to_string()))
-}
 
 fn point_in_simplex_error(py: Python<'_>, err: geom::GeometryError) -> PyErr {
     match err {
@@ -126,7 +122,7 @@ fn py_point_in_simplex(
 ) -> PyResult<bool> {
     let point = parse_point(point)?;
     let simplex = parse_points_sized(simplex, "Please provide a 2-dimensional list of points")?;
-    geom::point_in_simplex(&point, &simplex, eps.unwrap_or(1e-8))
+    geom::point_in_simplex(&point, &simplex, eps.unwrap_or(tolerances::BARYCENTRIC_EPS))
         .map_err(|err| point_in_simplex_error(py, err))
 }
 
@@ -152,7 +148,7 @@ fn py_fast_2d_point_in_simplex(
             [simplex[1][0], simplex[1][1]],
             [simplex[2][0], simplex[2][1]],
         ],
-        eps.unwrap_or(1e-8),
+        eps.unwrap_or(tolerances::BARYCENTRIC_EPS),
     )
     .map_err(|err| point_in_simplex_error(py, err))
 }

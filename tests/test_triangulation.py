@@ -277,6 +277,70 @@ def test_add_point_in_tiny_interval_far_from_origin_1d():
     assert_1d_triangulation_state(tri)
 
 
+def all_vertices_connected(tri) -> bool:
+    return all(len(tri.vertex_to_simplices[i]) > 0 for i in range(len(tri.vertices)))
+
+
+def test_add_point_in_small_scale_mesh_2d_keeps_all_simplices():
+    # Regression: the absolute degenerate-volume cutoff (matching the Python
+    # reference) deleted every candidate simplex below 1e-8 volume, silently
+    # emptying the mesh on insertion into a finely refined region.
+    tri = rust_tri.Triangulation([[0, 0], [1e-4, 0], [0, 1e-4], [1e-4, 1e-4]])
+
+    deleted, added = tri.add_point([5e-5, 6e-5])
+
+    assert len(deleted) == 2
+    assert len(added) == 4
+    assert len(tri.simplices) == 4
+    assert all_vertices_connected(tri)
+    assert tri.reference_invariant()
+
+
+def test_near_duplicate_insertion_2d_is_rejected_not_orphaned():
+    # Regression: a point within the circumcircle slack of every simplex
+    # around an existing vertex deleted them all and orphaned that vertex.
+    # It must instead be rejected as a duplicate, leaving the state intact.
+    pts = [
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [0.5, 1.0],
+        [0.5, 0.5],
+        [0.5 + 1e-6, 0.5],
+        [0.5, 0.5 + 1e-6],
+    ]
+    tri = rust_tri.Triangulation(pts)
+    before = as_simplex_set(tri.simplices)
+
+    with pytest.raises(ValueError, match="Point already in triangulation"):
+        tri.add_point([0.5 + 2e-10, 0.5 + 2e-10])
+
+    assert as_simplex_set(tri.simplices) == before
+    assert len(tri.vertices) == len(pts)
+    assert all_vertices_connected(tri)
+    assert tri.reference_invariant()
+
+
+@pytest.mark.parametrize("dim", [2, 3])
+@pytest.mark.parametrize(
+    ("offset", "scale"),
+    [(100.0, 1e-5), (-1e6, 1e-2), (0.5, 1e-6)],
+    ids=["near-100", "near-minus-1e6", "near-half"],
+)
+def test_random_insertions_small_scale_far_from_origin(dim, offset, scale):
+    rng = np.random.default_rng(7)
+    pts = offset + scale * rng.random((30, dim))
+    tri = rust_tri.Triangulation(pts[: dim + 2].tolist())
+
+    for p in pts[dim + 2 :]:
+        tri.add_point(p.tolist())
+
+    assert all_vertices_connected(tri)
+    assert tri.reference_invariant()
+    assert all(v > 0 for v in tri.volumes())
+    interior = pts.mean(axis=0)
+    assert len(tri.locate_point(interior.tolist())) == dim + 1
+
+
 def test_add_point_near_shared_vertex_keeps_vertex_connected_1d():
     # Regression: the circumcircle cascade also deleted the long neighbouring
     # interval the point is strictly outside of, orphaning the shared vertex.
