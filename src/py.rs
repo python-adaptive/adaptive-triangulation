@@ -297,7 +297,7 @@ fn scipy_delaunay_simplices(
 /// Python-facing `Triangulation`, a thin argument-parsing wrapper around the
 /// pure-Rust [`Triangulation`] core. Drop-in compatible with
 /// `adaptive.learner.triangulation.Triangulation`.
-#[pyclass(name = "Triangulation")]
+#[pyclass(name = "Triangulation", module = "adaptive_triangulation._rust")]
 pub struct PyTriangulation {
     pub core: Triangulation,
 }
@@ -569,17 +569,59 @@ impl PyVertexToSimplicesProxy {
 
 #[pymethods]
 impl PyTriangulation {
+    /// The optional `simplices` argument restores an exact prior state
+    /// (used by `__reduce__` for pickle/deepcopy) instead of triangulating
+    /// the points; the reference constructor has no such argument.
     #[new]
-    fn new(py: Python<'_>, coords: &Bound<'_, PyAny>) -> PyResult<Self> {
+    #[pyo3(signature = (coords, simplices=None))]
+    fn new(
+        py: Python<'_>,
+        coords: &Bound<'_, PyAny>,
+        simplices: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
         let parsed_coords =
             parse_points_sized(coords, "Please provide a 2-dimensional list of points")?;
         let dim = Triangulation::validate_coords(&parsed_coords)?;
+
+        if let Some(simplices) = given(simplices) {
+            let simplices = simplex_set_from_py(simplices, parsed_coords.len())?;
+            let core = Triangulation::from_simplices(parsed_coords, simplices)?;
+            return Ok(Self { core });
+        }
 
         let core = match scipy_delaunay_simplices(py, &parsed_coords, dim)? {
             Some(initial) => Triangulation::from_simplices(parsed_coords, initial),
             None => Triangulation::new(parsed_coords),
         }?;
         Ok(Self { core })
+    }
+
+    /// Pickle/copy support (the reference is a plain Python class, so
+    /// adaptive expects triangulations to survive `deepcopy` and `pickle`,
+    /// e.g. in `LearnerND._get_data`). Reconstructs through the constructor's
+    /// `simplices` argument, restoring the exact simplex set without
+    /// re-triangulating.
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+        let class = py.get_type::<PyTriangulation>();
+        let vertices: Vec<Py<PyAny>> = self
+            .core
+            .vertices
+            .iter()
+            .map(|point| point_tuple(py, point).into())
+            .collect();
+        let simplices: Vec<Py<PyAny>> = self
+            .core
+            .simplices()
+            .map(|simplex| simplex_tuple(py, simplex).into())
+            .collect();
+        let args = PyTuple::new(
+            py,
+            [
+                PyList::new(py, vertices)?.into_any(),
+                PyList::new(py, simplices)?.into_any(),
+            ],
+        )?;
+        Ok((class.unbind().into_any(), args.unbind().into_any()))
     }
 
     fn add_simplex(&mut self, simplex: &Bound<'_, PyAny>) -> PyResult<()> {
