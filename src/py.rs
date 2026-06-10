@@ -21,14 +21,14 @@ use crate::triangulation::{
     index_out_of_range, reduced_simplex_positions, Simplex, Triangulation, TriangulationError,
 };
 
-impl TriangulationError {
-    pub(crate) fn into_pyerr(self) -> PyErr {
-        match self {
-            Self::Value(message) => PyValueError::new_err(message),
-            Self::Index(message) => PyIndexError::new_err(message),
-            Self::Runtime(message) => PyRuntimeError::new_err(message),
-            Self::Assertion(message) => PyAssertionError::new_err(message),
-            Self::Geometry(error) => PyValueError::new_err(error.to_string()),
+impl From<TriangulationError> for PyErr {
+    fn from(error: TriangulationError) -> PyErr {
+        match error {
+            TriangulationError::Value(message) => PyValueError::new_err(message),
+            TriangulationError::Index(message) => PyIndexError::new_err(message),
+            TriangulationError::Runtime(message) => PyRuntimeError::new_err(message),
+            TriangulationError::Assertion(message) => PyAssertionError::new_err(message),
+            TriangulationError::Geometry(error) => PyValueError::new_err(error.to_string()),
         }
     }
 }
@@ -137,12 +137,17 @@ pub(crate) fn parse_signed_index_set(obj: &Bound<'_, PyAny>) -> PyResult<FxHashS
     Ok(indices)
 }
 
+/// Collapses an absent argument and an explicit Python `None` to `None`,
+/// so optional-argument parsing reads as one `match` arm instead of three.
+fn given<'a, 'py>(obj: Option<&'a Bound<'py, PyAny>>) -> Option<&'a Bound<'py, PyAny>> {
+    obj.filter(|value| !value.is_none())
+}
+
 pub(crate) fn parse_optional_transform(
     obj: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Option<Vec<Vec<f64>>>> {
-    match obj {
+    match given(obj) {
         None => Ok(None),
-        Some(value) if value.is_none() => Ok(None),
         Some(value) => Ok(Some(parse_points_sized(
             value,
             "Expected an N x N transform matrix",
@@ -191,25 +196,24 @@ pub(crate) fn normalize_index_set(
 }
 
 fn ordered_indices_from_py(obj: &Bound<'_, PyAny>, len: usize) -> PyResult<Vec<usize>> {
-    normalize_indices(&parse_signed_indices(obj)?, len).map_err(TriangulationError::into_pyerr)
+    normalize_indices(&parse_signed_indices(obj)?, len).map_err(PyErr::from)
 }
 
 fn canonical_simplex_from_py(obj: &Bound<'_, PyAny>, len: usize) -> PyResult<Simplex> {
-    canonicalize_simplex(&parse_signed_indices(obj)?, len).map_err(TriangulationError::into_pyerr)
+    canonicalize_simplex(&parse_signed_indices(obj)?, len).map_err(PyErr::from)
 }
 
 fn simplex_set_from_py(obj: &Bound<'_, PyAny>, len: usize) -> PyResult<FxHashSet<Simplex>> {
     let simplices = parse_signed_simplex_set(obj)?;
     let mut normalized = FxHashSet::default();
     for simplex in simplices {
-        normalized
-            .insert(normalize_indices(&simplex, len).map_err(TriangulationError::into_pyerr)?);
+        normalized.insert(normalize_indices(&simplex, len)?);
     }
     Ok(normalized)
 }
 
 fn vertex_index_set_from_py(obj: &Bound<'_, PyAny>, len: usize) -> PyResult<FxHashSet<usize>> {
-    normalize_index_set(&parse_signed_index_set(obj)?, len).map_err(TriangulationError::into_pyerr)
+    normalize_index_set(&parse_signed_index_set(obj)?, len).map_err(PyErr::from)
 }
 pub(crate) fn point_tuple(py: Python<'_>, point: &[f64]) -> Py<PyTuple> {
     PyTuple::new(py, point.iter().copied()).unwrap().into()
@@ -330,6 +334,20 @@ impl PySimplicesProxy {
             None => simplex_set_py(py, triangulation.core.simplices()),
         }
     }
+
+    /// `snapshot <op> other`, delegated to Python's set type.
+    fn set_op(&self, py: Python<'_>, op: &str, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Ok(self
+            .snapshot_set(py)?
+            .bind(py)
+            .call_method1(op, (other,))?
+            .unbind())
+    }
+
+    /// `other <op> snapshot`, delegated to Python's set type.
+    fn set_rop(&self, py: Python<'_>, op: &str, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        Ok(other.call_method1(op, (self.snapshot_set(py)?,))?.unbind())
+    }
 }
 
 /// Lazy, sequence-like view of the vertex coordinates (supports `__array__`
@@ -427,59 +445,35 @@ impl PySimplicesProxy {
     // binary set operators to a snapshot set, in both operand orders.
 
     fn __sub__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        Ok(self
-            .snapshot_set(py)?
-            .bind(py)
-            .call_method1("__sub__", (other,))?
-            .unbind())
+        self.set_op(py, "__sub__", other)
     }
 
     fn __rsub__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        Ok(other
-            .call_method1("__sub__", (self.snapshot_set(py)?,))?
-            .unbind())
+        self.set_rop(py, "__sub__", other)
     }
 
     fn __and__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        Ok(self
-            .snapshot_set(py)?
-            .bind(py)
-            .call_method1("__and__", (other,))?
-            .unbind())
+        self.set_op(py, "__and__", other)
     }
 
     fn __rand__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        Ok(other
-            .call_method1("__and__", (self.snapshot_set(py)?,))?
-            .unbind())
+        self.set_rop(py, "__and__", other)
     }
 
     fn __or__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        Ok(self
-            .snapshot_set(py)?
-            .bind(py)
-            .call_method1("__or__", (other,))?
-            .unbind())
+        self.set_op(py, "__or__", other)
     }
 
     fn __ror__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        Ok(other
-            .call_method1("__or__", (self.snapshot_set(py)?,))?
-            .unbind())
+        self.set_rop(py, "__or__", other)
     }
 
     fn __xor__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        Ok(self
-            .snapshot_set(py)?
-            .bind(py)
-            .call_method1("__xor__", (other,))?
-            .unbind())
+        self.set_op(py, "__xor__", other)
     }
 
     fn __rxor__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        Ok(other
-            .call_method1("__xor__", (self.snapshot_set(py)?,))?
-            .unbind())
+        self.set_rop(py, "__xor__", other)
     }
 }
 
@@ -518,8 +512,7 @@ impl PyVertexToSimplicesIter {
 impl PyVerticesProxy {
     fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Py<PyTuple>> {
         let triangulation = self.triangulation.bind(py).borrow();
-        let index = normalize_index(index, triangulation.core.vertices.len())
-            .map_err(TriangulationError::into_pyerr)?;
+        let index = normalize_index(index, triangulation.core.vertices.len())?;
         Ok(point_tuple(py, &triangulation.core.vertices[index]))
     }
 
@@ -558,8 +551,7 @@ impl PyVerticesProxy {
 impl PyVertexToSimplicesProxy {
     fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Py<PyAny>> {
         let triangulation = self.triangulation.bind(py).borrow();
-        let index = normalize_index(index, triangulation.core.vertices.len())
-            .map_err(TriangulationError::into_pyerr)?;
+        let index = normalize_index(index, triangulation.core.vertices.len())?;
         simplex_set_py(py, triangulation.core.simplices_of(index))
     }
 
@@ -581,14 +573,12 @@ impl PyTriangulation {
     fn new(py: Python<'_>, coords: &Bound<'_, PyAny>) -> PyResult<Self> {
         let parsed_coords =
             parse_points_sized(coords, "Please provide a 2-dimensional list of points")?;
-        let dim = Triangulation::validate_coords(&parsed_coords)
-            .map_err(TriangulationError::into_pyerr)?;
+        let dim = Triangulation::validate_coords(&parsed_coords)?;
 
         let core = match scipy_delaunay_simplices(py, &parsed_coords, dim)? {
             Some(initial) => Triangulation::from_simplices(parsed_coords, initial),
             None => Triangulation::new(parsed_coords),
-        }
-        .map_err(TriangulationError::into_pyerr)?;
+        }?;
         Ok(Self { core })
     }
 
@@ -598,14 +588,12 @@ impl PyTriangulation {
                 simplex,
                 self.core.vertices.len(),
             )?)
-            .map_err(TriangulationError::into_pyerr)
+            .map_err(PyErr::from)
     }
 
     fn delete_simplex(&mut self, simplex: &Bound<'_, PyAny>) -> PyResult<()> {
         let simplex = canonical_simplex_from_py(simplex, self.core.vertices.len())?;
-        self.core
-            .delete_simplex(&simplex)
-            .map_err(TriangulationError::into_pyerr)
+        self.core.delete_simplex(&simplex).map_err(PyErr::from)
     }
 
     #[pyo3(signature = (point, simplex=None, transform=None))]
@@ -617,16 +605,12 @@ impl PyTriangulation {
         transform: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let point = parse_point(point)?;
-        let simplex = match simplex {
+        let simplex = match given(simplex) {
             None => None,
-            Some(value) if value.is_none() => None,
             Some(value) => Some(canonical_simplex_from_py(value, self.core.vertices.len())?),
         };
         let transform = parse_optional_transform(transform)?;
-        let (deleted, added) = self
-            .core
-            .add_point(point, simplex, transform)
-            .map_err(TriangulationError::into_pyerr)?;
+        let (deleted, added) = self.core.add_point(point, simplex, transform)?;
         Ok((simplex_set_py(py, &deleted)?, simplex_set_py(py, &added)?))
     }
 
@@ -661,14 +645,13 @@ impl PyTriangulation {
         py: Python<'_>,
         vertex: isize,
     ) -> PyResult<Py<PySimplicesProxy>> {
-        let vertex = normalize_index(vertex, slf.core.vertices.len())
-            .map_err(TriangulationError::into_pyerr)?;
+        let vertex = normalize_index(vertex, slf.core.vertices.len())?;
         Py::new(py, PySimplicesProxy::for_vertex(slf.into(), vertex))
     }
 
     #[getter(hull)]
     fn hull_property(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let hull = self.core.hull().map_err(TriangulationError::into_pyerr)?;
+        let hull = self.core.hull()?;
         let vertices: Vec<usize> = hull.into_iter().collect();
         Ok(PySet::new(py, &vertices)?.into())
     }
@@ -699,8 +682,7 @@ impl PyTriangulation {
                 items.push(py.None());
                 continue;
             }
-            let index = normalize_index(item.extract::<isize>()?, self.core.vertices.len())
-                .map_err(TriangulationError::into_pyerr)?;
+            let index = normalize_index(item.extract::<isize>()?, self.core.vertices.len())?;
             items.push(point_tuple(py, &self.core.vertices[index]).into());
         }
         Ok(PyList::new(py, items)?.into())
@@ -708,11 +690,7 @@ impl PyTriangulation {
 
     fn locate_point(&self, py: Python<'_>, point: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let point = parse_point(point)?;
-        match self
-            .core
-            .locate_point(&point)
-            .map_err(TriangulationError::into_pyerr)?
-        {
+        match self.core.locate_point(&point)? {
             Some(simplex) => Ok(simplex_tuple(py, &simplex).into()),
             None => Ok(PyTuple::empty(py).into()),
         }
@@ -731,17 +709,14 @@ impl PyTriangulation {
         // For a full simplex the reference echoes back the caller's indices
         // (including negative ones), so reduce positions rather than values.
         if simplex_signed.len() == self.core.dim + 1 {
-            self.core
-                .validate_point_dim(&point)
-                .map_err(TriangulationError::into_pyerr)?;
-            let simplex = normalize_indices(&simplex_signed, self.core.vertices.len())
-                .map_err(TriangulationError::into_pyerr)?;
+            self.core.validate_point_dim(&point)?;
+            let simplex = normalize_indices(&simplex_signed, self.core.vertices.len())?;
             let alpha = match self.core.barycentric_alpha_for_simplex(&simplex, &point) {
                 Ok(alpha) => alpha,
                 Err(TriangulationError::Geometry(GeometryError::SingularMatrix)) => {
                     return Err(numpy_linalg_error(py, "Singular matrix"));
                 }
-                Err(other) => return Err(other.into_pyerr()),
+                Err(other) => return Err(other.into()),
             };
             let reduced: Vec<isize> = reduced_simplex_positions(&alpha, eps)
                 .into_iter()
@@ -750,14 +725,13 @@ impl PyTriangulation {
             return signed_index_list_py(py, &reduced);
         }
 
-        let simplex = normalize_indices(&simplex_signed, self.core.vertices.len())
-            .map_err(TriangulationError::into_pyerr)?;
+        let simplex = normalize_indices(&simplex_signed, self.core.vertices.len())?;
         let reduced = match self.core.get_reduced_simplex(&point, &simplex, eps) {
             Ok(reduced) => reduced,
             Err(TriangulationError::Geometry(GeometryError::SingularMatrix)) => {
                 return Err(numpy_linalg_error(py, "Singular matrix"));
             }
-            Err(other) => return Err(other.into_pyerr()),
+            Err(other) => return Err(other.into()),
         };
         index_list_py(py, &reduced)
     }
@@ -771,10 +745,7 @@ impl PyTriangulation {
     ) -> PyResult<(Py<PyTuple>, f64)> {
         let simplex = ordered_indices_from_py(simplex, self.core.vertices.len())?;
         let transform = parse_optional_transform(transform)?;
-        let (center, radius) = self
-            .core
-            .circumscribed_circle(&simplex, &transform)
-            .map_err(TriangulationError::into_pyerr)?;
+        let (center, radius) = self.core.circumscribed_circle(&simplex, &transform)?;
         Ok((point_tuple(py, &center), radius))
     }
 
@@ -785,13 +756,12 @@ impl PyTriangulation {
         simplex: &Bound<'_, PyAny>,
         transform: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
-        let pt_index = normalize_index(pt_index, self.core.vertices.len())
-            .map_err(TriangulationError::into_pyerr)?;
+        let pt_index = normalize_index(pt_index, self.core.vertices.len())?;
         let simplex = ordered_indices_from_py(simplex, self.core.vertices.len())?;
         let transform = parse_optional_transform(transform)?;
         self.core
             .point_in_circumcircle(pt_index, &simplex, &transform)
-            .map_err(TriangulationError::into_pyerr)
+            .map_err(PyErr::from)
     }
 
     #[pyo3(name = "point_in_cicumcircle", signature = (pt_index, simplex, transform=None))]
@@ -806,13 +776,11 @@ impl PyTriangulation {
 
     fn volume(&self, simplex: &Bound<'_, PyAny>) -> PyResult<f64> {
         let simplex = ordered_indices_from_py(simplex, self.core.vertices.len())?;
-        self.core
-            .volume(&simplex)
-            .map_err(TriangulationError::into_pyerr)
+        self.core.volume(&simplex).map_err(PyErr::from)
     }
 
     fn volumes(&self) -> PyResult<Vec<f64>> {
-        self.core.volumes().map_err(TriangulationError::into_pyerr)
+        self.core.volumes().map_err(PyErr::from)
     }
 
     #[pyo3(signature = (dim=None, simplices=None, vertices=None))]
@@ -822,32 +790,23 @@ impl PyTriangulation {
         simplices: Option<&Bound<'_, PyAny>>,
         vertices: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyFacesIter> {
-        let simplices = match simplices {
+        let simplices = match given(simplices) {
             None => None,
-            Some(value) if value.is_none() => None,
             Some(value) => Some(simplex_set_from_py(value, self.core.vertices.len())?),
         };
-        let vertices = match vertices {
+        let vertices = match given(vertices) {
             None => None,
-            Some(value) if value.is_none() => None,
             Some(value) => Some(vertex_index_set_from_py(value, self.core.vertices.len())?),
         };
         let items = self
             .core
-            .faces(dim, simplices.as_ref(), vertices.as_ref())
-            .map_err(TriangulationError::into_pyerr)?;
+            .faces(dim, simplices.as_ref(), vertices.as_ref())?;
         Ok(PyFacesIter { items, index: 0 })
     }
 
     fn containing(&self, py: Python<'_>, face: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let face = ordered_indices_from_py(face, self.core.vertices.len())?;
-        simplex_set_py(
-            py,
-            &self
-                .core
-                .containing(&face)
-                .map_err(TriangulationError::into_pyerr)?,
-        )
+        simplex_set_py(py, &self.core.containing(&face)?)
     }
 
     fn reference_invariant(&self) -> bool {
@@ -878,7 +837,7 @@ impl PyTriangulation {
             Err(TriangulationError::Geometry(GeometryError::SingularMatrix)) => {
                 Err(numpy_linalg_error(py, "Singular matrix"))
             }
-            Err(other) => Err(other.into_pyerr()),
+            Err(other) => Err(other.into()),
         }
     }
 
@@ -890,18 +849,15 @@ impl PyTriangulation {
         containing_simplex: Option<&Bound<'_, PyAny>>,
         transform: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
-        let pt_index = normalize_index(pt_index, self.core.vertices.len())
-            .map_err(TriangulationError::into_pyerr)?;
-        let containing_simplex = match containing_simplex {
+        let pt_index = normalize_index(pt_index, self.core.vertices.len())?;
+        let containing_simplex = match given(containing_simplex) {
             None => None,
-            Some(value) if value.is_none() => None,
             Some(value) => Some(canonical_simplex_from_py(value, self.core.vertices.len())?),
         };
         let transform = parse_optional_transform(transform)?;
         let (deleted, added) = self
             .core
-            .bowyer_watson(pt_index, containing_simplex, &transform)
-            .map_err(TriangulationError::into_pyerr)?;
+            .bowyer_watson(pt_index, containing_simplex, &transform)?;
         Ok((simplex_set_py(py, &deleted)?, simplex_set_py(py, &added)?))
     }
 
@@ -910,8 +866,7 @@ impl PyTriangulation {
         match index {
             None => Ok(py.None()),
             Some(index) => {
-                let index = normalize_index(index, self.core.vertices.len())
-                    .map_err(TriangulationError::into_pyerr)?;
+                let index = normalize_index(index, self.core.vertices.len())?;
                 Ok(point_tuple(py, &self.core.vertices[index]).into())
             }
         }
@@ -923,10 +878,7 @@ impl PyTriangulation {
         simplex: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let indices = ordered_indices_from_py(simplex, self.core.vertices.len())?;
-        let neighbors = self
-            .core
-            .neighbors_from_vertices(&indices)
-            .map_err(TriangulationError::into_pyerr)?;
+        let neighbors = self.core.neighbors_from_vertices(&indices)?;
         simplex_set_py(py, &neighbors)
     }
 
@@ -936,10 +888,7 @@ impl PyTriangulation {
         indices: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let indices = ordered_indices_from_py(indices, self.core.vertices.len())?;
-        let attached = self
-            .core
-            .simplices_attached_to_points(&indices)
-            .map_err(TriangulationError::into_pyerr)?;
+        let attached = self.core.simplices_attached_to_points(&indices)?;
         simplex_set_py(py, &attached)
     }
 
@@ -949,10 +898,7 @@ impl PyTriangulation {
         simplex: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyTuple>> {
         let simplex = ordered_indices_from_py(simplex, self.core.vertices.len())?;
-        let opposing = self
-            .core
-            .opposing_vertices(&simplex)
-            .map_err(TriangulationError::into_pyerr)?;
+        let opposing = self.core.opposing_vertices(&simplex)?;
         Ok(PyTuple::new(py, opposing)?.into())
     }
 

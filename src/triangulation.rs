@@ -74,6 +74,12 @@ pub enum TriangulationError {
     Geometry(#[from] GeometryError),
 }
 
+impl TriangulationError {
+    fn value(message: impl Into<String>) -> Self {
+        Self::Value(message.into())
+    }
+}
+
 pub(crate) fn index_out_of_range() -> TriangulationError {
     TriangulationError::Index("list index out of range".to_string())
 }
@@ -86,8 +92,8 @@ fn validate_transform(
         return Ok(());
     };
     if transform.len() != dim || transform.iter().any(|row| row.len() != dim) {
-        return Err(TriangulationError::Value(
-            "Transform must be an N x N matrix".to_string(),
+        return Err(TriangulationError::value(
+            "Transform must be an N x N matrix",
         ));
     }
     Ok(())
@@ -274,6 +280,13 @@ impl Triangulation {
             .is_some_and(|slot| slot.is_some())
     }
 
+    /// The simplex on the other side of `facet` from `id`, or `None` when
+    /// the facet lies on the hull.
+    fn facet_neighbour(&self, facet: &[usize], id: SimplexId) -> Option<SimplexId> {
+        let incident = self.facets.get(facet)?;
+        incident.iter().copied().find(|&other| other != id)
+    }
+
     /// Intern `simplex` (which must already be sorted) and update every
     /// derived index. Returns `false` (and changes nothing) when it is
     /// already present.
@@ -352,19 +365,17 @@ impl Triangulation {
 
     pub(crate) fn validate_coords(coords: &[Vec<f64>]) -> Result<usize, TriangulationError> {
         if coords.is_empty() {
-            return Err(TriangulationError::Value(
-                "Please provide at least one simplex".to_string(),
+            return Err(TriangulationError::value(
+                "Please provide at least one simplex",
             ));
         }
         let dim = coords[0].len();
         if coords.iter().any(|coord| coord.len() != dim) {
-            return Err(TriangulationError::Value(
-                "Coordinates dimension mismatch".to_string(),
-            ));
+            return Err(TriangulationError::value("Coordinates dimension mismatch"));
         }
         if coords.len() < dim + 1 {
-            return Err(TriangulationError::Value(
-                "Please provide at least one simplex".to_string(),
+            return Err(TriangulationError::value(
+                "Please provide at least one simplex",
             ));
         }
 
@@ -373,8 +384,8 @@ impl Triangulation {
             .map(|coord| coord.iter().zip(&coords[0]).map(|(a, b)| a - b).collect())
             .collect();
         if geometry::numpy_matrix_rank(&vectors)? < dim {
-            return Err(TriangulationError::Value(
-                "Initial simplex has zero volumes (the points are linearly dependent)".to_string(),
+            return Err(TriangulationError::value(
+                "Initial simplex has zero volumes (the points are linearly dependent)",
             ));
         }
 
@@ -383,9 +394,7 @@ impl Triangulation {
 
     pub(crate) fn validate_point_dim(&self, point: &[f64]) -> Result<(), TriangulationError> {
         if point.len() != self.dim {
-            return Err(TriangulationError::Value(
-                "Coordinates dimension mismatch".to_string(),
-            ));
+            return Err(TriangulationError::value("Coordinates dimension mismatch"));
         }
         Ok(())
     }
@@ -421,8 +430,8 @@ impl Triangulation {
             }
         }
 
-        Err(TriangulationError::Value(
-            "Initial simplex has zero volumes (the points are linearly dependent)".to_string(),
+        Err(TriangulationError::value(
+            "Initial simplex has zero volumes (the points are linearly dependent)",
         ))
     }
 
@@ -500,8 +509,8 @@ impl Triangulation {
             let reduced_simplex =
                 triangulation.get_reduced_simplex(&point, &actual_simplex, BARYCENTRIC_EPS)?;
             if reduced_simplex.is_empty() {
-                return Err(TriangulationError::Value(
-                    "Point lies outside of the specified simplex.".to_string(),
+                return Err(TriangulationError::value(
+                    "Point lies outside of the specified simplex.",
                 ));
             }
             if reduced_simplex.len() == 1 {
@@ -544,6 +553,16 @@ impl Triangulation {
         self.vertex_to_ids.pop();
     }
 
+    /// Delete every simplex attached to `vertex` (rollback of a failed
+    /// insertion).
+    fn detach_vertex(&mut self, vertex: PointIndex) -> Result<(), TriangulationError> {
+        let attached: Vec<Simplex> = self.simplices_of(vertex).cloned().collect();
+        for simplex in attached {
+            self.delete_simplex(&simplex)?;
+        }
+        Ok(())
+    }
+
     /// Number of simplices the given vertex belongs to.
     pub fn vertex_simplex_count(&self, vertex: PointIndex) -> usize {
         self.vertex_to_ids[vertex].len()
@@ -584,7 +603,7 @@ impl Triangulation {
         let mut simplex = simplex.to_vec();
         simplex.sort_unstable();
         if !self.unlink_simplex(&simplex) {
-            return Err(TriangulationError::Value("Simplex not present".to_string()));
+            return Err(TriangulationError::value("Simplex not present"));
         }
         Ok(())
     }
@@ -649,11 +668,7 @@ impl Triangulation {
         }
 
         let face = facet_excluding(simplex, worst_idx);
-        let neighbour = self
-            .facets
-            .get(&face)
-            .and_then(|incident| incident.iter().copied().find(|&other| other != id));
-        Ok(match neighbour {
+        Ok(match self.facet_neighbour(&face, id) {
             Some(next) => WalkStep::Neighbour(next),
             None => WalkStep::OutsideHull,
         })
@@ -741,8 +756,8 @@ impl Triangulation {
         vertices: Option<&FxHashSet<usize>>,
     ) -> Result<Vec<Simplex>, TriangulationError> {
         if simplices.is_some() && vertices.is_some() {
-            return Err(TriangulationError::Value(
-                "Only one of simplices and vertices is allowed.".to_string(),
+            return Err(TriangulationError::value(
+                "Only one of simplices and vertices is allowed.",
             ));
         }
 
@@ -789,37 +804,36 @@ impl Triangulation {
         }
         self.validate_simplex_indices(face)?;
 
+        let mut result = FxHashSet::default();
+
         // A facet-sized face is a single lookup in the facet index.
         if face.len() == self.dim {
             let mut sorted = face.to_vec();
             sorted.sort_unstable();
-            return Ok(self
-                .facets
-                .get(&sorted)
-                .map(|incident| {
-                    incident
-                        .iter()
-                        .map(|&id| self.simplex_by_id(id).clone())
-                        .collect()
-                })
-                .unwrap_or_default());
+            if let Some(incident) = self.facets.get(&sorted) {
+                for &id in incident {
+                    result.insert(self.simplex_by_id(id).clone());
+                }
+            }
+            return Ok(result);
         }
 
+        // Otherwise intersect the vertex incidence sets, scanning the vertex
+        // with the fewest simplices and testing each against the others.
         let first_vertex = face
             .iter()
             .copied()
             .min_by_key(|&vertex| self.vertex_to_ids[vertex].len())
             .unwrap();
-        Ok(self.vertex_to_ids[first_vertex]
-            .iter()
-            .copied()
-            .filter(|&id| {
-                face.iter().all(|&vertex| {
-                    vertex == first_vertex || self.vertex_to_ids[vertex].contains(&id)
-                })
-            })
-            .map(|id| self.simplex_by_id(id).clone())
-            .collect())
+        for &id in &self.vertex_to_ids[first_vertex] {
+            let in_all = face
+                .iter()
+                .all(|&vertex| vertex == first_vertex || self.vertex_to_ids[vertex].contains(&id));
+            if in_all {
+                result.insert(self.simplex_by_id(id).clone());
+            }
+        }
+        Ok(result)
     }
 
     /// All simplices that share at least one vertex with the given vertex
@@ -877,32 +891,27 @@ impl Triangulation {
         sorted.sort_unstable();
         self.validate_simplex_indices(&sorted)?;
         let Some(&own_id) = self.ids.get(&sorted) else {
-            return Err(TriangulationError::Value(
-                "Provided simplex is not part of the triangulation".to_string(),
+            return Err(TriangulationError::value(
+                "Provided simplex is not part of the triangulation",
             ));
         };
 
-        simplex
-            .iter()
-            .map(|&vertex| {
-                let position = sorted
+        let mut opposing = Vec::with_capacity(simplex.len());
+        for &vertex in simplex {
+            let position = sorted
+                .iter()
+                .position(|&other| other == vertex)
+                .expect("vertex comes from the simplex itself");
+            let facet = facet_excluding(&sorted, position);
+            opposing.push(self.facet_neighbour(&facet, own_id).map(|id| {
+                self.simplex_by_id(id)
                     .iter()
-                    .position(|&other| other == vertex)
-                    .expect("vertex comes from the simplex itself");
-                let facet = facet_excluding(&sorted, position);
-                let neighbour = self
-                    .facets
-                    .get(&facet)
-                    .and_then(|incident| incident.iter().copied().find(|&id| id != own_id));
-                Ok(neighbour.map(|id| {
-                    self.simplex_by_id(id)
-                        .iter()
-                        .copied()
-                        .find(|other| !sorted.contains(other))
-                        .expect("facet neighbour has exactly one vertex outside the simplex")
-                }))
-            })
-            .collect()
+                    .copied()
+                    .find(|other| !sorted.contains(other))
+                    .expect("facet neighbour has exactly one vertex outside the simplex")
+            }));
+        }
+        Ok(opposing)
     }
 
     fn simplex_points(
@@ -1112,9 +1121,7 @@ impl Triangulation {
             if !point_connected {
                 // Even the repaired cavity cannot connect the point: it is
                 // numerically indistinguishable from existing structure.
-                return Err(TriangulationError::Value(
-                    "Point already in triangulation.".to_string(),
-                ));
+                return Err(TriangulationError::value("Point already in triangulation."));
             }
         }
 
@@ -1132,9 +1139,7 @@ impl Triangulation {
                 .iter()
                 .all(|id| bad_ids.contains(id))
             {
-                return Err(TriangulationError::Value(
-                    "Point already in triangulation.".to_string(),
-                ));
+                return Err(TriangulationError::value("Point already in triangulation."));
             }
         }
 
@@ -1197,9 +1202,8 @@ impl Triangulation {
         candidates: &[Simplex],
     ) -> (FxHashSet<Simplex>, FxHashSet<Simplex>, bool) {
         let bad_set: FxHashSet<&Simplex> = bad_simplices.iter().collect();
-        let mut new_triangles: FxHashSet<Simplex> = self.vertex_to_ids[pt_index]
-            .iter()
-            .map(|&id| self.simplex_by_id(id))
+        let mut new_triangles: FxHashSet<Simplex> = self
+            .simplices_of(pt_index)
             .filter(|simplex| !bad_set.contains(simplex))
             .cloned()
             .collect();
@@ -1222,11 +1226,11 @@ impl Triangulation {
     /// (in 2D/3D) so the conservation check compares true volumes instead of
     /// cancellation noise when the cavity contains slivers.
     fn summed_volume(&self, simplices: &FxHashSet<Simplex>) -> Result<f64, TriangulationError> {
-        simplices.iter().try_fold(0.0, |acc, simplex| {
-            Ok::<f64, TriangulationError>(
-                acc + geometry::precise_volume(&self.get_vertices(simplex)?)?,
-            )
-        })
+        let mut total = 0.0;
+        for simplex in simplices {
+            total += geometry::precise_volume(&self.get_vertices(simplex)?)?;
+        }
+        Ok(total)
     }
 
     /// Rebuild the cavity with exact in-circumsphere predicates (2D/3D
@@ -1414,15 +1418,9 @@ impl Triangulation {
         }
 
         if new_simplices.is_empty() {
-            let attached: Vec<Simplex> = self.vertex_to_ids[pt_index]
-                .iter()
-                .map(|&id| self.simplex_by_id(id).clone())
-                .collect();
-            for simplex in attached {
-                self.delete_simplex(&simplex)?;
-            }
-            return Err(TriangulationError::Value(
-                "Candidate vertex is inside the hull.".to_string(),
+            self.detach_vertex(pt_index)?;
+            return Err(TriangulationError::value(
+                "Candidate vertex is inside the hull.",
             ));
         }
 
@@ -1465,13 +1463,7 @@ impl Triangulation {
                 // bowyer_watson mutates, so only the hull extension
                 // needs rolling back.
                 Err(err @ (TriangulationError::Value(_) | TriangulationError::Assertion(_))) => {
-                    let attached: Vec<Simplex> = self.vertex_to_ids[pt_index]
-                        .iter()
-                        .map(|&id| self.simplex_by_id(id).clone())
-                        .collect();
-                    for simplex in attached {
-                        self.delete_simplex(&simplex)?;
-                    }
+                    self.detach_vertex(pt_index)?;
                     self.pop_vertex();
                     return Err(err);
                 }
@@ -1491,16 +1483,14 @@ impl Triangulation {
 
         let reduced_simplex = self.get_reduced_simplex(&point, &simplex, BARYCENTRIC_EPS)?;
         if reduced_simplex.is_empty() {
-            return Err(TriangulationError::Value(
-                "Point lies outside of the specified simplex.".to_string(),
+            return Err(TriangulationError::value(
+                "Point lies outside of the specified simplex.",
             ));
         }
         simplex = reduced_simplex;
 
         if simplex.len() == 1 {
-            return Err(TriangulationError::Value(
-                "Point already in triangulation.".to_string(),
-            ));
+            return Err(TriangulationError::value("Point already in triangulation."));
         }
 
         let pt_index = self.add_vertex(point);

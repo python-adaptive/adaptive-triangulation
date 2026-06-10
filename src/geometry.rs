@@ -303,14 +303,7 @@ pub fn fast_3d_circumsphere(points: &[[f64; 3]; 4]) -> ([f64; 3], f64) {
 /// `|x_i|^2 - |x_0|^2` form cancels catastrophically for small simplices far
 /// from the origin). Returns NaNs for degenerate input, matching numpy.
 pub fn circumsphere(pts: &[Vec<f64>]) -> Result<(Vec<f64>, f64), GeometryError> {
-    let dim = validate_points(pts)?;
-    if pts.len() != dim + 1 {
-        return Err(GeometryError::InvalidDimensions(format!(
-            "Expected {} points for a {}-dimensional simplex",
-            dim + 1,
-            dim
-        )));
-    }
+    let dim = validate_simplex(pts)?;
 
     if dim == 2 {
         let points = [
@@ -441,6 +434,47 @@ pub fn orientation(face: &[Vec<f64>], origin: &[f64]) -> Result<i32, GeometryErr
     }
 }
 
+/// `robust::Coord` from the first two coordinates of a point.
+fn coord_2d(point: &[f64]) -> robust::Coord<f64> {
+    robust::Coord {
+        x: point[0],
+        y: point[1],
+    }
+}
+
+/// `robust::Coord3D` from the first three coordinates of a point.
+fn coord_3d(point: &[f64]) -> robust::Coord3D<f64> {
+    robust::Coord3D {
+        x: point[0],
+        y: point[1],
+        z: point[2],
+    }
+}
+
+fn sign(value: f64) -> i32 {
+    if value > 0.0 {
+        1
+    } else if value < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+/// Validates that `points` are a full simplex (`dim + 1` points of equal
+/// dimension) and returns `dim`.
+fn validate_simplex(points: &[Vec<f64>]) -> Result<usize, GeometryError> {
+    let dim = validate_points(points)?;
+    if points.len() != dim + 1 {
+        return Err(GeometryError::InvalidDimensions(format!(
+            "Expected {} points for a {}-dimensional simplex",
+            dim + 1,
+            dim
+        )));
+    }
+    Ok(dim)
+}
+
 /// Like [`orientation`], but exact in 2D and 3D: the sign is computed with
 /// Shewchuk's adaptive-precision predicates (via the `robust` crate), so it
 /// is correct even for slivers whose floating-point determinant rounds to
@@ -460,54 +494,21 @@ pub fn robust_orientation(face: &[Vec<f64>], origin: &[f64]) -> Result<i32, Geom
         ));
     }
 
+    // orient2d(a, b, c) = det [[a - c], [b - c]] and orient3d(a, b, c, d) =
+    // det [[a - d], [b - d], [c - d]]: exactly the determinants whose sign
+    // `orientation` computes.
     match dim {
-        // orient2d(a, b, c) = det [[a - c], [b - c]], exactly the
-        // determinant `orientation` takes the sign of.
-        2 => {
-            let det = robust::orient2d(
-                robust::Coord {
-                    x: face[0][0],
-                    y: face[0][1],
-                },
-                robust::Coord {
-                    x: face[1][0],
-                    y: face[1][1],
-                },
-                robust::Coord {
-                    x: origin[0],
-                    y: origin[1],
-                },
-            );
-            Ok(if det > 0.0 {
-                1
-            } else if det < 0.0 {
-                -1
-            } else {
-                0
-            })
-        }
-        // orient3d(a, b, c, d) = det [[a - d], [b - d], [c - d]], exactly the
-        // determinant `orientation` takes the sign of.
-        3 => {
-            let coord = |point: &[f64]| robust::Coord3D {
-                x: point[0],
-                y: point[1],
-                z: point[2],
-            };
-            let det = robust::orient3d(
-                coord(&face[0]),
-                coord(&face[1]),
-                coord(&face[2]),
-                coord(origin),
-            );
-            Ok(if det > 0.0 {
-                1
-            } else if det < 0.0 {
-                -1
-            } else {
-                0
-            })
-        }
+        2 => Ok(sign(robust::orient2d(
+            coord_2d(&face[0]),
+            coord_2d(&face[1]),
+            coord_2d(origin),
+        ))),
+        3 => Ok(sign(robust::orient3d(
+            coord_3d(&face[0]),
+            coord_3d(&face[1]),
+            coord_3d(&face[2]),
+            coord_3d(origin),
+        ))),
         _ => orientation(face, origin),
     }
 }
@@ -527,56 +528,36 @@ pub fn robust_in_circumsphere(
     simplex: &[Vec<f64>],
     point: &[f64],
 ) -> Result<Option<bool>, GeometryError> {
-    let dim = validate_points(simplex)?;
-    if simplex.len() != dim + 1 || point.len() != dim {
-        return Err(GeometryError::InvalidDimensions(format!(
-            "Expected {} points for a {}-dimensional simplex",
-            dim + 1,
-            dim
-        )));
+    let dim = validate_simplex(simplex)?;
+    if point.len() != dim {
+        return Err(GeometryError::InvalidDimensions(
+            "Coordinates dimension mismatch".to_string(),
+        ));
     }
 
+    // incircle/insphere's sign follows the simplex's orientation;
+    // multiplying by it makes the test orientation-independent.
     match dim {
-        // incircle's sign follows the triangle's orientation; multiplying
-        // by orient2d makes the test orientation-independent.
         2 => {
-            let coord = |p: &[f64]| robust::Coord { x: p[0], y: p[1] };
-            let orient =
-                robust::orient2d(coord(&simplex[0]), coord(&simplex[1]), coord(&simplex[2]));
+            let [a, b, c] = [&simplex[0], &simplex[1], &simplex[2]].map(|p| coord_2d(p));
+            let orient = robust::orient2d(a, b, c);
             if orient == 0.0 {
                 return Ok(Some(false));
             }
-            let incircle = robust::incircle(
-                coord(&simplex[0]),
-                coord(&simplex[1]),
-                coord(&simplex[2]),
-                coord(point),
-            );
-            Ok(Some(incircle * orient > 0.0))
+            Ok(Some(
+                robust::incircle(a, b, c, coord_2d(point)) * orient > 0.0,
+            ))
         }
         3 => {
-            let coord = |p: &[f64]| robust::Coord3D {
-                x: p[0],
-                y: p[1],
-                z: p[2],
-            };
-            let orient = robust::orient3d(
-                coord(&simplex[0]),
-                coord(&simplex[1]),
-                coord(&simplex[2]),
-                coord(&simplex[3]),
-            );
+            let [a, b, c, d] =
+                [&simplex[0], &simplex[1], &simplex[2], &simplex[3]].map(|p| coord_3d(p));
+            let orient = robust::orient3d(a, b, c, d);
             if orient == 0.0 {
                 return Ok(Some(false));
             }
-            let insphere = robust::insphere(
-                coord(&simplex[0]),
-                coord(&simplex[1]),
-                coord(&simplex[2]),
-                coord(&simplex[3]),
-                coord(point),
-            );
-            Ok(Some(insphere * orient > 0.0))
+            Ok(Some(
+                robust::insphere(a, b, c, d, coord_3d(point)) * orient > 0.0,
+            ))
         }
         _ => Ok(None),
     }
@@ -592,39 +573,21 @@ pub fn robust_in_circumsphere(
 /// floating-point determinants); use it where an accurate value matters,
 /// e.g. the volume-conservation check in Bowyer-Watson.
 pub fn precise_volume(vertices: &[Vec<f64>]) -> Result<f64, GeometryError> {
-    let dim = validate_points(vertices)?;
-    if vertices.len() != dim + 1 {
-        return Err(GeometryError::InvalidDimensions(format!(
-            "Expected {} points for a {}-dimensional simplex",
-            dim + 1,
-            dim
-        )));
-    }
-
-    match dim {
+    match validate_simplex(vertices)? {
         2 => {
-            let coord = |point: &[f64]| robust::Coord {
-                x: point[0],
-                y: point[1],
-            };
             let det = robust::orient2d(
-                coord(&vertices[1]),
-                coord(&vertices[2]),
-                coord(&vertices[0]),
+                coord_2d(&vertices[1]),
+                coord_2d(&vertices[2]),
+                coord_2d(&vertices[0]),
             );
             Ok(det.abs() / 2.0)
         }
         3 => {
-            let coord = |point: &[f64]| robust::Coord3D {
-                x: point[0],
-                y: point[1],
-                z: point[2],
-            };
             let det = robust::orient3d(
-                coord(&vertices[1]),
-                coord(&vertices[2]),
-                coord(&vertices[3]),
-                coord(&vertices[0]),
+                coord_3d(&vertices[1]),
+                coord_3d(&vertices[2]),
+                coord_3d(&vertices[3]),
+                coord_3d(&vertices[0]),
             );
             Ok(det.abs() / 6.0)
         }
@@ -635,14 +598,7 @@ pub fn precise_volume(vertices: &[Vec<f64>]) -> Result<f64, GeometryError> {
 /// Volume of a `dim`-simplex given its `dim + 1` vertices
 /// (`|det| / dim!` of the edge matrix).
 pub fn volume(vertices: &[Vec<f64>]) -> Result<f64, GeometryError> {
-    let dim = validate_points(vertices)?;
-    if vertices.len() != dim + 1 {
-        return Err(GeometryError::InvalidDimensions(format!(
-            "Expected {} points for a {}-dimensional simplex",
-            dim + 1,
-            dim
-        )));
-    }
+    let dim = validate_simplex(vertices)?;
 
     let mut matrix = vec![vec![0.0; dim]; dim];
     let x0 = &vertices[0];
