@@ -1,8 +1,7 @@
 """Measure the LearnerND speedup from `simplices_containing` and `default_loss`.
 
-This monkeypatches adaptive (the PR #493 branch, with the Rust backend
-active) to use the two batched APIs, the way the adaptive-side integration
-would:
+This monkeypatches adaptive (>= 1.5.0, with the Rust backend active) to use
+the two batched APIs, the way the adaptive-side integration would:
 
 - ``tell_pending`` distributes a pending point over the simplices containing
   it with one ``tri.simplices_containing(point, simplex=hint)`` call instead
@@ -11,8 +10,7 @@ would:
   wrapper around ``simplex_volume_in_embedding``.
 
 Requirements:
-    pip install adaptive-triangulation
-    pip install "adaptive @ git+https://github.com/python-adaptive/adaptive@refs/pull/493/head"
+    pip install "adaptive[rust]>=1.5"
 """
 
 from __future__ import annotations
@@ -92,7 +90,7 @@ def run(
 
 
 CONFIGS = [
-    ("baseline (Rust backend, PR #493)", False, False),
+    ("baseline (Rust backend, adaptive >= 1.5)", False, False),
     ("+ rust default_loss", True, False),
     ("+ simplices_containing tell_pending", False, True),
     ("+ both", True, True),
