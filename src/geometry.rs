@@ -8,7 +8,7 @@
 use nalgebra::{DMatrix, DVector};
 use thiserror::Error;
 
-use crate::tolerances::ORIENTATION_LOG_DET_CUTOFF;
+use crate::tolerances::{EMBEDDED_VOLUME_SQ_EPS, ORIENTATION_LOG_DET_CUTOFF};
 
 /// Errors produced by the geometric primitives.
 #[derive(Debug, Error)]
@@ -622,24 +622,55 @@ pub fn simplex_volume_in_embedding(vertices: &[Vec<f64>]) -> Result<f64, Geometr
         ));
     }
 
+    // Degenerate inputs (collinear/coplanar/coincident vertices) have volume
+    // 0.0, like the reference: adaptive's loss functions feed those routinely
+    // (e.g. curvature losses on a locally flat function) and expect a zero
+    // loss back. Only inputs whose squared volume is more negative than
+    // rounding noise (`EMBEDDED_VOLUME_SQ_EPS`) are an error, plus the cases
+    // where the reference's 2D Heron path raises.
+    let dim = vertices[0].len();
+
     if vertices.len() == 2 {
         let length_sq = squared_distance(&vertices[0], &vertices[1]);
-        if length_sq == 0.0 {
+        if length_sq == 0.0 && dim == 2 {
+            // The reference's 2D path raises for anything but 3 vertices; in
+            // higher embeddings its Cayley-Menger path returns 0.0.
             return Err(GeometryError::DegenerateSimplex);
         }
         return Ok(length_sq.sqrt());
     }
 
     if vertices.len() == 3 {
-        let a = squared_distance(&vertices[0], &vertices[1]).sqrt();
-        let b = squared_distance(&vertices[1], &vertices[2]).sqrt();
-        let c = squared_distance(&vertices[2], &vertices[0]).sqrt();
-        let s = 0.5 * (a + b + c);
-        let area_sq = s * (s - a) * (s - b) * (s - c);
-        if area_sq <= 0.0 {
+        let d01 = squared_distance(&vertices[0], &vertices[1]);
+        let d12 = squared_distance(&vertices[1], &vertices[2]);
+        let d02 = squared_distance(&vertices[2], &vertices[0]);
+
+        if dim == 2 {
+            // The reference uses Heron's formula with explicit square roots
+            // in 2D; its sqrt raises for any negative product
+            // (`math domain error`), so no tolerance band here.
+            let (a, b, c) = (d01.sqrt(), d12.sqrt(), d02.sqrt());
+            let s = 0.5 * (a + b + c);
+            let area_sq = s * (s - a) * (s - b) * (s - c);
+            if area_sq >= 0.0 {
+                return Ok(area_sq.sqrt());
+            }
             return Err(GeometryError::DegenerateSimplex);
         }
-        return Ok(area_sq.sqrt());
+
+        // Cayley-Menger determinant for three vertices, expanded in squared
+        // distances (16·area² = 2(d01·d12 + d12·d02 + d02·d01) − d01² − d12²
+        // − d02²), so its rounding near zero behaves like the reference's
+        // numeric determinant and the same tolerance band applies.
+        let area_sq =
+            (2.0 * (d01 * d12 + d12 * d02 + d02 * d01) - d01 * d01 - d12 * d12 - d02 * d02) / 16.0;
+        if area_sq >= 0.0 {
+            return Ok(area_sq.sqrt());
+        }
+        if area_sq > -EMBEDDED_VOLUME_SQ_EPS {
+            return Ok(0.0);
+        }
+        return Err(GeometryError::DegenerateSimplex);
     }
 
     let n = vertices.len();
@@ -660,10 +691,13 @@ pub fn simplex_volume_in_embedding(vertices: &[Vec<f64>]) -> Result<f64, Geometr
 
     let coeff = -(-2.0f64).powi((n - 1) as i32) * factorial(n - 1).powi(2);
     let vol_square = determinant(&matrix)? / coeff;
-    if vol_square <= 0.0 {
-        return Err(GeometryError::DegenerateSimplex);
+    if vol_square >= 0.0 {
+        return Ok(vol_square.sqrt());
     }
-    Ok(vol_square.sqrt())
+    if vol_square > -EMBEDDED_VOLUME_SQ_EPS {
+        return Ok(0.0);
+    }
+    Err(GeometryError::DegenerateSimplex)
 }
 
 /// The loss adaptive's `LearnerND` assigns to a simplex by default: the
@@ -691,9 +725,48 @@ mod tests {
     }
 
     #[test]
-    fn simplex_volume_in_embedding_rejects_identical_endpoints() {
+    fn simplex_volume_in_embedding_rejects_identical_endpoints_in_2d() {
         let err = simplex_volume_in_embedding(&[vec![1.0, 2.0], vec![1.0, 2.0]]).unwrap_err();
         assert!(matches!(err, GeometryError::DegenerateSimplex));
+    }
+
+    #[test]
+    fn simplex_volume_in_embedding_identical_endpoints_in_3d_is_zero() {
+        let volume =
+            simplex_volume_in_embedding(&[vec![1.0, 2.0, 3.0], vec![1.0, 2.0, 3.0]]).unwrap();
+        assert_eq!(volume, 0.0);
+    }
+
+    #[test]
+    fn simplex_volume_in_embedding_collinear_triangle_in_3d_is_zero() {
+        let volume = simplex_volume_in_embedding(&[
+            vec![0.0, 0.0, 0.0],
+            vec![1.0, 1.0, 1.0],
+            vec![2.0, 2.0, 2.0],
+        ])
+        .unwrap();
+        assert_eq!(volume, 0.0);
+    }
+
+    #[test]
+    fn simplex_volume_in_embedding_collinear_triangle_in_2d_is_zero() {
+        // Heron's formula gives exactly 0 here (s - c == 0), like the
+        // reference's sqrt(0); only negative products are an error in 2D.
+        let volume =
+            simplex_volume_in_embedding(&[vec![0.0, 0.0], vec![1.0, 1.0], vec![2.0, 2.0]]).unwrap();
+        assert_eq!(volume, 0.0);
+    }
+
+    #[test]
+    fn simplex_volume_in_embedding_coplanar_tetrahedron_is_zero() {
+        let volume = simplex_volume_in_embedding(&[
+            vec![0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![1.0, 1.0, 0.0],
+        ])
+        .unwrap();
+        assert_eq!(volume, 0.0);
     }
 
     #[test]
