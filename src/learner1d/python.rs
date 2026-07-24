@@ -202,7 +202,7 @@ impl PyLearner1D {
     }
 
     #[getter]
-    fn data<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+    fn data(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dict = pyo3::types::PyDict::new(py);
         // Include both in-bounds and out-of-bounds data (matches Python behavior)
         for (&x, y) in self
